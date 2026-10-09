@@ -103,9 +103,7 @@ jobs:
             --base-sha "$BASE_SHA" \
             --patch-sha "$PATCH_SHA" \
             --cutlass-sha "$CUTLASS_SHA" \
-            --output-json artifacts/warp-codegen-report.json \
-            --output-notes artifacts/warp-codegen-notes.md
-          cat artifacts/warp-codegen-notes.md
+            --output-json artifacts/warp-codegen-report.json
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
