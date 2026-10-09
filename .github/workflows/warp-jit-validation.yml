@@ -1,0 +1,335 @@
+# This uses the upstream CUDA wheel only as its unchanged host/runtime package.
+# It copies the exact source templates and regression test out of the checkout,
+# then invokes the public TileLang warp-reduce API in fresh Python processes.
+# The warp-validation runner is an SM120 RTX 5070: f32 min/max use the generic
+# shuffle path there (SM100 redux requires the SM100 feature macros), while
+# int32 also exercises the SM80+ integral redux path.
+name: Warp reduction JIT validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact fork commit containing the helper fix and regression tests
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: warp-reduction-jit-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  cuda:
+    runs-on: [self-hosted, linux, x64, warp-validation]
+    timeout-minutes: 35
+    env:
+      CUDA_HOME: /home/sgtpepper/.local/cuda-13.3
+      NVCC_CCBIN: /usr/bin/g++-15
+      CXX: /usr/bin/g++-15
+      TILELANG_DISABLE_CACHE: "1"
+      PYTHONPATH: ""
+    steps:
+      - name: Check out exact source commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source and reusable host-code boundary
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          BASELINE_SHA=194c1b897aa5269e9a89d44c88efdf578a3df620
+          WHEEL_SOURCE_SHA=adeea32bcecdddca32195a95e90730b175606a0e
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C source cat-file -e "${BASELINE_SHA}^{commit}"
+          git -C source cat-file -e "${WHEEL_SOURCE_SHA}^{commit}"
+          git -C source merge-base --is-ancestor "$BASELINE_SHA" "$SOURCE_SHA"
+
+          # The upstream wheel's host/native/codegen inputs were source-byte-
+          # identical to 194c1b8. Keep reuse valid only for this header/test/doc
+          # patch shape; a host-side change requires an exact-head package build.
+          expected_files=$(printf '%s\n' \
+            docs/programming_guides/instructions.md \
+            src/tl_templates/cuda/reduce.h \
+            testing/python/language/test_tilelang_language_warp_reduce.py)
+          actual_files=$(git -C source diff --name-only "$BASELINE_SHA" "$SOURCE_SHA" | LC_ALL=C sort)
+          if [[ "$actual_files" != "$expected_files" ]]; then
+            printf 'Unexpected files in source patch:\n%s\n' "$actual_files"
+            exit 1
+          fi
+
+          git -C source diff --exit-code "$WHEEL_SOURCE_SHA" "$BASELINE_SHA" -- \
+            src/cuda/codegen/codegen_cuda.cc \
+            src/op/builtin.cc \
+            tilelang/language/reduce_op.py \
+            tilelang/jit/adapter/nvrtc/libgen.py \
+            tilelang/env.py \
+            tilelang/__init__.py \
+            tilelang/libinfo.py \
+            tilelang/testing/__init__.py \
+            CMakeLists.txt \
+            cmake/BackendOptions.cmake \
+            cmake/FindPipCUDAToolkit.cmake \
+            pyproject.toml \
+            version_provider.py \
+            3rdparty/tvm \
+            3rdparty/cutlass
+
+          printf 'SOURCE_SHA=%s\nBASELINE_SHA=%s\nWHEEL_SOURCE_SHA=%s\n' \
+            "$SOURCE_SHA" "$BASELINE_SHA" "$WHEEL_SOURCE_SHA"
+          git -C source submodule status 3rdparty/tvm 3rdparty/cutlass
+          sha256sum \
+            source/src/tl_templates/cuda/reduce.h \
+            source/src/tl_templates/cuda/nvrtc_std.h \
+            source/testing/python/language/test_tilelang_language_warp_reduce.py
+
+      - name: Verify pinned upstream wheel artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          command -v gh
+          metadata=$(gh api repos/tile-ai/tilelang/actions/artifacts/11591218180 \
+            --jq '[.id, .name, .size_in_bytes, .digest, (.expired | tostring), .workflow_run.head_sha] | @tsv')
+          expected=$(printf '%s\t%s\t%s\t%s\t%s\t%s' \
+            11591218180 \
+            wheels-3.10-Linux-X64-CUDA-13.0 \
+            49326603 \
+            sha256:9bb426b22b2773782db29a25f28051812554ef1f5e312ad16cc9574855063302 \
+            false \
+            adeea32bcecdddca32195a95e90730b175606a0e)
+          printf '%s\n' "$metadata"
+          test "$metadata" = "$expected"
+
+      - name: Download the pinned wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: wheels-3.10-Linux-X64-CUDA-13.0
+          run-id: 37870584206
+          repository: tile-ai/tilelang
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/tile-wheelhouse
+
+      - name: Reuse Python 3.12 and dependency caches
+        run: |
+          set -euo pipefail
+          command -v uv
+          uv --version
+          uv python find 3.12
+          /usr/bin/g++-15 --version
+          echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
+          echo "UV_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/uv" >> "$GITHUB_ENV"
+          echo "PIP_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/pip" >> "$GITHUB_ENV"
+
+      - name: Install the wheel, matching Torch, and pytest
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/jit-results"
+          mapfile -t wheels < <(find "${RUNNER_TEMP}/tile-wheelhouse" -maxdepth 1 -type f -name 'tilelang-*.whl' -print | sort)
+          test "${#wheels[@]}" -eq 1
+          wheel=${wheels[0]}
+          case "$(basename "$wheel")" in
+            tilelang-*-cp39-abi3-manylinux*x86_64.whl) ;;
+            *) echo "Unexpected wheel filename: $wheel" >&2; exit 1 ;;
+          esac
+          sha256sum "$wheel" | tee "$GITHUB_WORKSPACE/jit-results/wheel.sha256"
+
+          uv venv --python 3.12 "${RUNNER_TEMP}/tilelang-venv"
+          uv pip install --python "${RUNNER_TEMP}/tilelang-venv/bin/python" \
+            --index-url https://download.pytorch.org/whl/cu130 \
+            'torch==2.14.1+cu130'
+          uv pip install --python "${RUNNER_TEMP}/tilelang-venv/bin/python" \
+            "$wheel" 'pytest>=6.2.4'
+
+      - name: Prepare external test and template trees
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/tile-templates-baseline" "${RUNNER_TEMP}/tile-templates-patched"
+          cp -a source/src/. "${RUNNER_TEMP}/tile-templates-baseline/"
+          cp -a source/src/. "${RUNNER_TEMP}/tile-templates-patched/"
+          git -C source show \
+            194c1b897aa5269e9a89d44c88efdf578a3df620:src/tl_templates/cuda/reduce.h \
+            > "${RUNNER_TEMP}/tile-templates-baseline/tl_templates/cuda/reduce.h"
+
+          # This header is prepended by TileLang's NVRTC path. Keep it available
+          # beside the selected reduce.h while the test itself runs outside the
+          # checkout's testing/conftest.py import hook.
+          cp source/src/tl_templates/cuda/nvrtc_std.h \
+            "${RUNNER_TEMP}/tile-templates-baseline/tl_templates/cuda/nvrtc_std.h"
+          cp source/src/tl_templates/cuda/nvrtc_std.h \
+            "${RUNNER_TEMP}/tile-templates-patched/tl_templates/cuda/nvrtc_std.h"
+          cp source/testing/python/language/test_tilelang_language_warp_reduce.py \
+            "${RUNNER_TEMP}/test_tilelang_language_warp_reduce.py"
+          cp source/testing/python/jit/test_tilelang_jit_nvrtc_std.py \
+            "${RUNNER_TEMP}/test_tilelang_jit_nvrtc_std.py"
+
+          {
+            printf 'baseline_reduce.h '
+            sha256sum "${RUNNER_TEMP}/tile-templates-baseline/tl_templates/cuda/reduce.h"
+            printf 'patched_reduce.h '
+            sha256sum "${RUNNER_TEMP}/tile-templates-patched/tl_templates/cuda/reduce.h"
+            printf 'nvrtc_std.h '
+            sha256sum "${RUNNER_TEMP}/tile-templates-patched/tl_templates/cuda/nvrtc_std.h"
+            printf 'test_module '
+            sha256sum "${RUNNER_TEMP}/test_tilelang_language_warp_reduce.py"
+          } | tee "$GITHUB_WORKSPACE/jit-results/source-files.sha256"
+
+      - name: Verify wheel imports, CUDA, Torch, and NVRTC
+        working-directory: ${{ runner.temp }}
+        env:
+          TL_TEMPLATE_PATH: ${{ runner.temp }}/tile-templates-patched
+          TILELANG_CACHE_DIR: ${{ runner.temp }}/tilelang-cache
+        run: |
+          set -euo pipefail
+          nvcc --version | tee "$GITHUB_WORKSPACE/jit-results/nvcc.txt"
+          nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv,noheader \
+            | tee "$GITHUB_WORKSPACE/jit-results/gpu.txt"
+          "${RUNNER_TEMP}/tilelang-venv/bin/python" - <<'PY' | tee "$GITHUB_WORKSPACE/jit-results/runtime.txt"
+          import importlib.metadata as metadata
+          import os
+          from pathlib import Path
+
+          import torch
+          import tilelang
+          from tilelang.env import CUDA_HOME, TILELANG_TEMPLATE_PATH
+          from cuda.bindings import nvrtc
+
+          package_path = Path(tilelang.__file__).resolve()
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          assert not package_path.is_relative_to(workspace / "source"), package_path
+          assert Path(TILELANG_TEMPLATE_PATH).resolve() == Path(os.environ["TL_TEMPLATE_PATH"]).resolve()
+          assert Path(TILELANG_TEMPLATE_PATH, "tl_templates/cuda/nvrtc_std.h").is_file()
+          assert Path(CUDA_HOME).resolve() == Path(os.environ["CUDA_HOME"]).resolve()
+          assert torch.cuda.is_available(), "CUDA is required for this validation"
+          assert torch.cuda.device_count() == 1, "Use the single-GPU warp-validation runner"
+          assert torch.cuda.get_device_capability(0) == (12, 0), "Use the SM120 warp-validation GPU"
+
+          print(f"tilelang={metadata.version('tilelang')} path={package_path}")
+          print(f"torch={torch.__version__} cuda={torch.version.cuda} path={Path(torch.__file__).resolve()}")
+          for distribution in ("cuda-bindings", "cuda-python", "pytest"):
+              try:
+                  print(f"{distribution}={metadata.version(distribution)}")
+              except metadata.PackageNotFoundError:
+                  print(f"{distribution}=not-installed")
+          print(f"cuda_home={Path(CUDA_HOME).resolve()}")
+          print(f"gpu={torch.cuda.get_device_name(0)} capability={torch.cuda.get_device_capability(0)}")
+          result, major, minor = nvrtc.nvrtcVersion()
+          assert result == nvrtc.nvrtcResult.NVRTC_SUCCESS
+          print(f"nvrtc={major}.{minor}")
+          print(f"tilelang_disable_cache={os.environ.get('TILELANG_DISABLE_CACHE')}")
+          PY
+
+      - name: Prove the baseline header fails only the selected semantic assertion
+        working-directory: ${{ runner.temp }}
+        env:
+          TL_TEMPLATE_PATH: ${{ runner.temp }}/tile-templates-baseline
+          TILELANG_CACHE_DIR: ${{ runner.temp }}/tilelang-cache-baseline
+        run: |
+          set -euo pipefail
+          python_bin="${RUNNER_TEMP}/tilelang-venv/bin/python"
+          test_file="${RUNNER_TEMP}/test_tilelang_language_warp_reduce.py"
+          node='test_warp_reduce_partial[min-float32-threads2]'
+          "$python_bin" -m pytest --collect-only -q "$test_file" \
+            | tee "$GITHUB_WORKSPACE/jit-results/collection.txt"
+          matches=$(grep -Fc "::$node" "$GITHUB_WORKSPACE/jit-results/collection.txt")
+          test "$matches" -eq 1
+
+          set +e
+          "$python_bin" -m pytest -q --junitxml="$GITHUB_WORKSPACE/jit-results/baseline.xml" \
+            "${test_file}::${node}" > "$GITHUB_WORKSPACE/jit-results/baseline.log" 2>&1
+          status=$?
+          set -e
+          cat "$GITHUB_WORKSPACE/jit-results/baseline.log"
+          test "$status" -eq 1
+
+          "$python_bin" - "$GITHUB_WORKSPACE/jit-results/baseline.xml" "$node" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          report, expected_name = sys.argv[1:]
+          root = ET.parse(report).getroot()
+          cases = root.findall(".//testcase")
+          assert len(cases) == 1, f"expected one baseline case; got {len(cases)}"
+          case = cases[0]
+          assert case.get("name") == expected_name, case.get("name")
+          failure = case.find("failure")
+          assert failure is not None, "baseline did not fail as a test assertion"
+          assert case.find("error") is None, "setup/runtime error is not semantic evidence"
+          assert case.find("skipped") is None, "a skipped test is not semantic evidence"
+          message = (failure.get("message") or "") + (failure.text or "")
+          assert "Tensor-likes are not close" in message, message
+          PY
+          echo 'BASELINE_HEADER_EXPECTED_FAILURE=PASS' | tee -a "$GITHUB_WORKSPACE/jit-results/status.txt"
+
+      - name: Run the full regression module with the exact input header
+        working-directory: ${{ runner.temp }}
+        env:
+          TL_TEMPLATE_PATH: ${{ runner.temp }}/tile-templates-patched
+          TILELANG_CACHE_DIR: ${{ runner.temp }}/tilelang-cache-patched
+        run: |
+          set -euo pipefail
+          python_bin="${RUNNER_TEMP}/tilelang-venv/bin/python"
+          test_file="${RUNNER_TEMP}/test_tilelang_language_warp_reduce.py"
+          "$python_bin" -m pytest -q --junitxml="$GITHUB_WORKSPACE/jit-results/patched.xml" \
+            "$test_file" 2>&1 | tee "$GITHUB_WORKSPACE/jit-results/patched.log"
+          "$python_bin" - "$GITHUB_WORKSPACE/jit-results/patched.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          cases = root.findall(".//testcase")
+          assert len(cases) == 185, f"expected 185 collected regression/control cases; got {len(cases)}"
+          failures = [case.get("name") for case in cases if case.find("failure") is not None]
+          errors = [case.get("name") for case in cases if case.find("error") is not None]
+          skipped = [case.get("name") for case in cases if case.find("skipped") is not None]
+          assert not failures, f"unexpected test failures: {failures}"
+          assert not errors, f"unexpected test errors: {errors}"
+          assert not skipped, f"CUDA regressions must not be skipped: {skipped}"
+          print(f"PATCHED_CASES_PASSED={len(cases)}; SKIPPED=0")
+          PY
+          echo 'PATCHED_HEADER_FULL_MODULE=PASS' | tee -a "$GITHUB_WORKSPACE/jit-results/status.txt"
+
+      - name: Run NVRTC controls
+        working-directory: ${{ runner.temp }}
+        env:
+          TL_TEMPLATE_PATH: ${{ runner.temp }}/tile-templates-patched
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/tilelang-venv/bin/python" -m pytest -q \
+            --junitxml="$GITHUB_WORKSPACE/jit-results/nvrtc.xml" \
+            "${RUNNER_TEMP}/test_tilelang_jit_nvrtc_std.py" \
+            2>&1 | tee "$GITHUB_WORKSPACE/jit-results/nvrtc.log"
+          "${RUNNER_TEMP}/tilelang-venv/bin/python" - "$GITHUB_WORKSPACE/jit-results/nvrtc.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
+          assert len(cases) == 14, len(cases)
+          assert all(not list(case) for case in cases), "NVRTC tests failed or skipped"
+          print("NVRTC_CASES_PASSED=14; SKIPPED=0")
+          PY
+
+      - name: Check repository conventions
+        working-directory: source
+        run: |
+          set -euo pipefail
+          uvx --from pre-commit pre-commit run --files \
+            src/tl_templates/cuda/reduce.h \
+            testing/python/language/test_tilelang_language_warp_reduce.py \
+            docs/programming_guides/instructions.md
+
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: warp-reduction-jit-results
+          path: jit-results/
+          if-no-files-found: warn
+          retention-days: 7
