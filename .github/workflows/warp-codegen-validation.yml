@@ -62,6 +62,7 @@ jobs:
           echo "CUTLASS_SHA=$patch_cutlass" >> "$GITHUB_ENV"
 
           BASE_TREE="$RUNNER_TEMP/tilelang-base-$PATCH_SHA"
+          git -C source worktree prune --expire now
           git -C source worktree add --detach "$BASE_TREE" "$BASE_SHA"
           echo "BASE_TREE=$BASE_TREE" >> "$GITHUB_ENV"
           printf 'base=%s\npatch=%s\ncutlass=%s\n' \
