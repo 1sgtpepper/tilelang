@@ -2,8 +2,8 @@
 
 // Compile this file to PTX for an ordinary CUDA target to inspect the partial
 // tail fallback, full-warp XOR tree, and integral redux fast path. Also compile
-// it for sm_100a and sm_100f to instantiate the feature-gated float min/max
-// returns; those are compile-only checks and do not imply SM100 runtime coverage.
+// it for sm_100a and sm_100f to check the existing feature selection. These
+// compile-only checks do not imply SM100 runtime coverage.
 
 __global__ void warp_codegen_f32_sum(float const *input, float *output) {
   int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);

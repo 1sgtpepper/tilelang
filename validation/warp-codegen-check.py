@@ -149,7 +149,7 @@ def main() -> int:
                 metrics = inspect(body)
                 report["kernels"].setdefault(target, {}).setdefault(kernel, {})[variant] = metrics
                 is_hardware_path = kernel == "warp_codegen_i32_sum" or (
-                    target in ("sm_100a", "sm_100f")
+                    target == "sm_100a"
                     and kernel in ("warp_codegen_f32_min", "warp_codegen_f32_max")
                 )
                 if is_hardware_path:
@@ -159,7 +159,7 @@ def main() -> int:
         (target, "warp_codegen_i32_sum", ("add.s32", "add.u32")) for target in TARGETS
     ] + [
         (target, "warp_codegen_f32_{}".format(op), ("{}.f32".format(op),))
-        for target in ("sm_100a", "sm_100f")
+        for target in ("sm_100a",)
         for op in ("min", "max")
     ]
     for target, kernel, redux_ops in hardware_cases:
@@ -171,8 +171,17 @@ def main() -> int:
             hardware_path_unchanged(data, unchanged, redux_ops),
         )
 
-    for kernel, words in (("warp_codegen_f32_sum", 1), ("warp_codegen_f64_sum", 2)):
-        data = report["kernels"]["sm_120"][kernel]
+    generic_cases = [
+        (target, kernel, words)
+        for target in TARGETS
+        for kernel, words in (("warp_codegen_f32_sum", 1), ("warp_codegen_f64_sum", 2))
+    ] + [
+        (target, "warp_codegen_f32_{}".format(op), 1)
+        for target in ("sm_120", "sm_100f")
+        for op in ("min", "max")
+    ]
+    for target, kernel, words in generic_cases:
+        data = report["kernels"][target][kernel]
         old, new = data["base"]["shuffle_counts"], data["candidate"]["shuffle_counts"]
         expected = [str(offset) for offset in (16, 8, 4, 2, 1) for _ in range(words)]
         offsets = {}
@@ -180,7 +189,7 @@ def main() -> int:
             offsets[variant] = [item["lane_or_delta"] for item in data[variant]["shuffle_operands"]["bfly"]]
         xor_ok = all(seq == expected for seq in offsets.values())
         xor_ok = xor_ok and offsets["base"] == offsets["candidate"]
-        add_check(report["checks"], "sm_120.{}.full_xor_preserved".format(kernel), xor_ok)
+        add_check(report["checks"], "{}.{}.full_xor_preserved".format(target, kernel), xor_ok)
         idx = [item["lane_or_delta"] for item in data["candidate"]["shuffle_operands"]["idx"]]
         tail_ok = (
             old.get("down", 0) == old.get("idx", 0) == 0
@@ -189,7 +198,7 @@ def main() -> int:
             and idx == ["0"] * words
             and new.get("bfly", 0) == old.get("bfly", 0) == 5 * words
         )
-        add_check(report["checks"], "sm_120.{}.tail_tree_added".format(kernel), tail_ok)
+        add_check(report["checks"], "{}.{}.tail_tree_added".format(target, kernel), tail_ok)
 
     failures = [item["name"] for item in report["checks"] if not item["passed"]]
     report["passed"], report["failed_checks"] = not failures, failures
