@@ -1,0 +1,71 @@
+name: Warp reduction validation
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit
+        required: true
+        type: string
+      expect_failure:
+        description: Baseline is expected to fail the semantic oracle
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  header:
+    runs-on: [self-hosted, linux, x64, warp-validation]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - name: Verify source and dependency
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C source submodule update --init --depth=1 3rdparty/cutlass
+          git -C source submodule status 3rdparty/cutlass
+          sha256sum source/src/tl_templates/cuda/reduce.h validation/validation/warp-reduce-check.cu
+          nvcc --version
+          /usr/bin/g++-15 --version
+          nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv,noheader
+      - name: Compile exact CUDA header
+        run: |
+          set -euo pipefail
+          nvcc -std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 \
+            -I source/src -I source/3rdparty/cutlass/include \
+            validation/validation/warp-reduce-check.cu -o warp-reduce-check
+      - name: Run per-lane oracle
+        env:
+          EXPECT_FAILURE: ${{ inputs.expect_failure }}
+        run: |
+          set -euo pipefail
+          set +e
+          ./warp-reduce-check > warp-results.log 2>&1
+          status=$?
+          set -e
+          cat warp-results.log
+          if [[ "$EXPECT_FAILURE" == true ]]; then
+            test "$status" = 1
+            grep -q '^SEMANTIC_FAILURE' warp-results.log
+            grep -q '^CASES=' warp-results.log
+          else
+            test "$status" = 0
+            grep -q 'FAILURES=0' warp-results.log
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: warp-validation-results
+          path: warp-results.log
