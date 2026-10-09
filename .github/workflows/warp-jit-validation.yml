@@ -31,6 +31,8 @@ jobs:
       NVCC_CCBIN: /usr/bin/g++-15
       CXX: /usr/bin/g++-15
       TILELANG_DISABLE_CACHE: "1"
+      UV_HTTP_TIMEOUT: "300"
+      UV_CONCURRENT_DOWNLOADS: "3"
       PYTHONPATH: ""
     steps:
       - name: Check out exact source commit
@@ -145,8 +147,7 @@ jobs:
 
           uv venv --python 3.12 "${RUNNER_TEMP}/tilelang-venv"
           uv pip install --python "${RUNNER_TEMP}/tilelang-venv/bin/python" \
-            --index-url https://download.pytorch.org/whl/cu130 \
-            'torch==2.14.1+cu130'
+            'https://download-r2.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=5359b255ac68c0cabb8293952b38e00f0d1a570815cd87f19b61af702c071410'
           uv pip install --python "${RUNNER_TEMP}/tilelang-venv/bin/python" \
             "$wheel" 'pytest>=6.2.4'
 
