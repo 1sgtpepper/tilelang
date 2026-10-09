@@ -1,0 +1,55 @@
+name: Warp guard comparison
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact validated source commit
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  guard:
+    runs-on: [self-hosted, linux, x64, warp-validation]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - name: Verify source and environment
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p guard-results
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C source submodule update --init --depth=1 3rdparty/cutlass
+          git -C source submodule status 3rdparty/cutlass | tee guard-results/cutlass.txt
+          sha256sum source/src/tl_templates/cuda/reduce.h validation/validation/warp-guard-comparison.cu | tee guard-results/source.sha256
+          nvcc --version | tee guard-results/nvcc.txt
+          nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv,noheader | tee guard-results/gpu.txt
+      - name: Compile exact helper and bounded alternative
+        run: |
+          set -euo pipefail
+          cuda_nvcc=$(readlink -f "$(command -v nvcc)")
+          cuda_root=$(dirname "$(dirname "$cuda_nvcc")")
+          args=(-std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 -I "$cuda_root/include/cccl" -I source/src -I source/3rdparty/cutlass/include)
+          "$cuda_nvcc" "${args[@]}" validation/validation/warp-guard-comparison.cu -o guard-comparison 2>&1 | tee guard-results/compile.log
+          "$cuda_nvcc" "${args[@]}" --ptx validation/validation/warp-guard-comparison.cu -o guard-results/repeated.ptx 2>&1 | tee guard-results/ptx.log
+      - name: Compare outputs and event timings
+        run: |
+          set -euo pipefail
+          ./guard-comparison | tee guard-results/comparison.txt
+          grep -q '^COMPARISON_OUTPUTS_EQUAL=PASS$' guard-results/comparison.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: warp-guard-comparison
+          path: guard-results/
