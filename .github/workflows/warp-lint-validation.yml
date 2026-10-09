@@ -1,0 +1,42 @@
+name: Warp reduction convention validation
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact candidate source commit
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Check exact source and repository conventions
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python -m pip install pre-commit
+          pre-commit run --files src/tl_templates/cuda/reduce.h \
+            testing/python/language/test_tilelang_language_warp_reduce.py \
+            docs/programming_guides/instructions.md
+          git diff --exit-code
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: failure()
+        with:
+          name: convention-failure-files
+          path: |
+            src/tl_templates/cuda/reduce.h
+            testing/python/language/test_tilelang_language_warp_reduce.py
+            docs/programming_guides/instructions.md
