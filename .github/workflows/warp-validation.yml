@@ -43,7 +43,10 @@ jobs:
       - name: Compile exact CUDA header
         run: |
           set -euo pipefail
-          nvcc -std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 \
+          cuda_nvcc=$(readlink -f "$(command -v nvcc)")
+          cuda_root=$(dirname "$(dirname "$cuda_nvcc")")
+          "$cuda_nvcc" -std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 \
+            -I "$cuda_root/include/cccl" \
             -I source/src -I source/3rdparty/cutlass/include \
             validation/validation/warp-reduce-check.cu -o warp-reduce-check
       - name: Run per-lane oracle
