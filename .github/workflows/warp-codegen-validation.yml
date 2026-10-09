@@ -1,0 +1,115 @@
+name: Warp reduction codegen validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_sha:
+        description: Exact candidate commit SHA to compile
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warp-codegen-${{ github.ref }}-${{ inputs.patch_sha }}
+  cancel-in-progress: false
+
+jobs:
+  ptx:
+    runs-on: [self-hosted, linux, x64, warp-validation]
+    timeout-minutes: 20
+    env:
+      PATCH_SHA: ${{ inputs.patch_sha }}
+      BASE_SHA: 194c1b897aa5269e9a89d44c88efdf578a3df620
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: validation
+          persist-credentials: false
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.patch_sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify commits, scope, and CUTLASS identity
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          [[ "$PATCH_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C source rev-parse HEAD)" = "$PATCH_SHA"
+          git -C source cat-file -e "$BASE_SHA^{commit}"
+
+          actual_paths="$RUNNER_TEMP/warp-codegen-actual-paths"
+          expected_paths="$RUNNER_TEMP/warp-codegen-expected-paths"
+          git -C source diff --name-only --no-renames "$BASE_SHA" "$PATCH_SHA" \
+            | LC_ALL=C sort > "$actual_paths"
+          printf '%s\n' \
+            docs/programming_guides/instructions.md \
+            src/tl_templates/cuda/reduce.h \
+            testing/python/language/test_tilelang_language_warp_reduce.py \
+            | LC_ALL=C sort > "$expected_paths"
+          diff -u "$expected_paths" "$actual_paths"
+
+          base_cutlass=$(git -C source rev-parse "$BASE_SHA:3rdparty/cutlass")
+          patch_cutlass=$(git -C source rev-parse "$PATCH_SHA:3rdparty/cutlass")
+          test "$base_cutlass" = "$patch_cutlass"
+          git -C source submodule update --init --depth=1 3rdparty/cutlass
+          test "$(git -C source/3rdparty/cutlass rev-parse HEAD)" = "$patch_cutlass"
+          echo "CUTLASS_SHA=$patch_cutlass" >> "$GITHUB_ENV"
+
+          BASE_TREE="$RUNNER_TEMP/tilelang-base-$PATCH_SHA"
+          git -C source worktree add --detach "$BASE_TREE" "$BASE_SHA"
+          echo "BASE_TREE=$BASE_TREE" >> "$GITHUB_ENV"
+          printf 'base=%s\npatch=%s\ncutlass=%s\n' \
+            "$BASE_SHA" "$PATCH_SHA" "$patch_cutlass" | tee artifacts/source-revisions.txt
+          sha256sum validation/validation/warp-codegen-check.cu \
+            validation/validation/warp-codegen-check.py | tee artifacts/probe-sha256.txt
+
+      - name: Compile six PTX variants without device execution
+        run: |
+          set -euo pipefail
+          cuda_nvcc=$(readlink -f "$(command -v nvcc)")
+          cuda_root=$(dirname "$(dirname "$cuda_nvcc")")
+          nvcc --version | tee artifacts/nvcc-version.txt
+          /usr/bin/g++-15 --version | tee artifacts/gcc-version.txt
+
+          for target in sm_120 sm_100a sm_100f; do
+            for variant in base candidate; do
+              if [[ "$variant" == base ]]; then
+                src_root="$BASE_TREE"
+              else
+                src_root=source
+              fi
+              output="artifacts/${variant}-${target}.ptx"
+              echo "Compiling ${variant} ${target} -> ${output}"
+              "$cuda_nvcc" --ptx -std=c++17 -O3 "-arch=${target}" \
+                -ccbin /usr/bin/g++-15 \
+                -I "$cuda_root/include/cccl" \
+                -I "$src_root/src" \
+                -I source/3rdparty/cutlass/include \
+                validation/validation/warp-codegen-check.cu \
+                -o "$output" 2>&1 | tee "artifacts/${variant}-${target}.compile.log"
+            done
+          done
+
+      - name: Compare anchored PTX paths and write report
+        run: |
+          set -euo pipefail
+          python3 validation/validation/warp-codegen-check.py artifacts \
+            --base-sha "$BASE_SHA" \
+            --patch-sha "$PATCH_SHA" \
+            --cutlass-sha "$CUTLASS_SHA" \
+            --output-json artifacts/warp-codegen-report.json \
+            --output-notes artifacts/warp-codegen-notes.md
+          cat artifacts/warp-codegen-notes.md
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: warp-codegen-${{ inputs.patch_sha }}
+          path: artifacts/
+          if-no-files-found: warn
