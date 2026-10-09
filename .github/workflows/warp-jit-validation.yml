@@ -267,7 +267,7 @@ jobs:
           assert case.find("error") is None, "setup/runtime error is not semantic evidence"
           assert case.find("skipped") is None, "a skipped test is not semantic evidence"
           message = (failure.get("message") or "") + (failure.text or "")
-          assert "Tensor-likes are not close" in message, message
+          assert "Tensor-likes are not equal!" in message, message
           PY
           echo 'BASELINE_HEADER_EXPECTED_FAILURE=PASS' | tee -a "$GITHUB_WORKSPACE/jit-results/status.txt"
 
