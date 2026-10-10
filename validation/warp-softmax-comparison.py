@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Paired CUDA-graph timing for a CI-only TileLang warp-softmax microkernel."""
 
 from __future__ import annotations
@@ -110,7 +109,7 @@ def worker(config: dict) -> int:
     import torch
     import tilelang
     import tilelang.language as T
-    from cuda.bindings import nvrtc
+    from cuda.bindings import nvrtc, runtime
     from tilelang.env import CUDA_HOME, TILELANG_TEMPLATE_PATH
 
     variant = config["variant"]
@@ -160,11 +159,29 @@ def worker(config: dict) -> int:
         raise AssertionError(f"{variant} softmax returned non-finite values")
     torch.testing.assert_close(y, reference, rtol=RTOL, atol=ATOL)
 
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream), torch.cuda.graph(graph):
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
         for _ in range(GRAPH_LAUNCHES):
             kernel(x, y, stream=stream.cuda_stream)
     stream.synchronize()
+    result, _, node_count = runtime.cudaGraphGetNodes(graph.raw_cuda_graph(), numNodes=0)
+    if result != runtime.cudaError_t.cudaSuccess or node_count != GRAPH_LAUNCHES:
+        raise AssertionError(f"expected {GRAPH_LAUNCHES} captured kernel nodes; got {node_count}, {result}")
+    result, nodes, node_count = runtime.cudaGraphGetNodes(graph.raw_cuda_graph(), numNodes=node_count)
+    if result != runtime.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"CUDA graph node query failed: {result}")
+    if node_count != GRAPH_LAUNCHES or len(nodes) != GRAPH_LAUNCHES:
+        raise AssertionError("CUDA graph node count changed between queries")
+    for node in nodes:
+        result, kind = runtime.cudaGraphNodeGetType(node)
+        if result != runtime.cudaError_t.cudaSuccess or kind != runtime.cudaGraphNodeType.cudaGraphNodeTypeKernel:
+            raise AssertionError(f"expected a captured kernel node; got {kind}, {result}")
+    graph.instantiate()
+    with torch.cuda.stream(stream):
+        y.fill_(float("nan"))
+        graph.replay()
+    stream.synchronize()
+    torch.testing.assert_close(y, reference, rtol=RTOL, atol=ATOL)
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     nvrtc_result, nvrtc_major, nvrtc_minor = nvrtc.nvrtcVersion()
     if nvrtc_result != nvrtc.nvrtcResult.NVRTC_SUCCESS:
@@ -193,6 +210,8 @@ def worker(config: dict) -> int:
         "threads_per_cta": THREADS,
         "rows_per_cta": ROWS_PER_CTA,
         "graph_launches_per_sample": GRAPH_LAUNCHES,
+        "captured_kernel_nodes": node_count,
+        "graph_replay_regenerated_nan_filled_output": True,
         "warmup_graph_replays": WARMUPS,
         "cache_policy": "repeated graph over reused input/output buffers; no flush or cache-residency claim",
         "max_abs_error_vs_torch_softmax": (y - reference).abs().max().item(),

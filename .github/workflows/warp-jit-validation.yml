@@ -415,15 +415,38 @@ jobs:
           baseline_sha=$(sha256sum "$RUNNER_TEMP/tile-templates-baseline/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
           candidate_sha=$(sha256sum "$RUNNER_TEMP/tile-templates-patched/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
           wheel_sha=$(sha256sum "$wheel" | cut -d' ' -f1)
-          "$RUNNER_TEMP/tilelang-venv/bin/python" \
-            "$GITHUB_WORKSPACE/validation/validation/warp-softmax-comparison.py" \
-            --baseline-template "$RUNNER_TEMP/tile-templates-baseline" \
-            --candidate-template "$RUNNER_TEMP/tile-templates-patched" \
-            --baseline-header-sha "$baseline_sha" --candidate-header-sha "$candidate_sha" \
-            --source-sha "$SOURCE_SHA" \
-            --wheel-source-sha adeea32bcecdddca32195a95e90730b175606a0e \
-            --wheel-path "$wheel" --wheel-sha "$wheel_sha" \
-            --output-dir "$RUNNER_TEMP/warp-softmax-$GITHUB_RUN_ID"
+          script="$GITHUB_WORKSPACE/validation/validation/warp-softmax-comparison.py"
+          output="$RUNNER_TEMP/warp-softmax-$GITHUB_RUN_ID"
+          args=(
+            --baseline-template "$RUNNER_TEMP/tile-templates-baseline"
+            --candidate-template "$RUNNER_TEMP/tile-templates-patched"
+            --baseline-header-sha "$baseline_sha" --candidate-header-sha "$candidate_sha"
+            --source-sha "$SOURCE_SHA"
+            --wheel-source-sha adeea32bcecdddca32195a95e90730b175606a0e
+            --wheel-path "$wheel" --wheel-sha "$wheel_sha"
+          )
+          mkdir -p "$output"
+          "$RUNNER_TEMP/tilelang-venv/bin/python" - "$script" "$RUNNER_TEMP/softmax-empty-capture.py" <<'PY'
+          from pathlib import Path
+          import sys
+          source = Path(sys.argv[1]).read_text()
+          correct = "torch.cuda.graph(graph, stream=stream)"
+          assert source.count(correct) == 1
+          Path(sys.argv[2]).write_text(source.replace(correct, "torch.cuda.graph(graph)"))
+          PY
+          if "$RUNNER_TEMP/tilelang-venv/bin/python" "$RUNNER_TEMP/softmax-empty-capture.py" \
+            "${args[@]}" --output-dir "$output/negative-capture" > "$output/negative-capture.log" 2>&1; then
+            printf '%s\n' 'Empty-capture negative control unexpectedly passed' >&2
+            exit 1
+          fi
+          "$RUNNER_TEMP/tilelang-venv/bin/python" - "$output/negative-capture.log" <<'PY'
+          from pathlib import Path
+          import sys
+          log = Path(sys.argv[1]).read_text()
+          assert "expected 128 captured kernel nodes; got 0" in log, log
+          print("EMPTY_CAPTURE_NEGATIVE_CONTROL_FAILED_AS_EXPECTED")
+          PY
+          "$RUNNER_TEMP/tilelang-venv/bin/python" "$script" "${args[@]}" --output-dir "$output/measurement"
 
       - name: Upload paired softmax evidence
         if: ${{ always() && inputs.softmax }}
