@@ -224,13 +224,12 @@ jobs:
                           raise SystemExit(f"{target} {kernel}: {name} down-shuffle shape changed")
                   if ballot["shuffle_operands"]["idx"] != redux["shuffle_operands"]["idx"]:
                       raise SystemExit(f"{target} {kernel}: lane-zero broadcast changed")
-                  if target != "sm_75":
-                      count_ops = redux["redux_counts"].get("add.s32", 0) + \
-                          redux["redux_counts"].get("add.u32", 0)
-                      if count_ops != 1:
-                          raise SystemExit(f"{target} {kernel}: expected one 32-bit redux.add participant count")
-                      if ballot["opcode_counts"].get("vote.sync.ballot.b32", 0) != 1:
-                          raise SystemExit(f"{target} {kernel}: expected one ballot baseline")
+                  count_ops = redux["redux_counts"].get("add.s32", 0) + \
+                      redux["redux_counts"].get("add.u32", 0)
+                  if count_ops != 1:
+                      raise SystemExit(f"{target} {kernel}: expected one 32-bit redux.add participant count")
+                  if ballot["opcode_counts"].get("vote.sync.ballot.b32", 0) != 1:
+                      raise SystemExit(f"{target} {kernel}: expected one ballot baseline")
                   checked.append((target, kernel, ballot, redux))
 
           print("Integer/native SM100 paths and SM75 fallback match the ballot header.")
