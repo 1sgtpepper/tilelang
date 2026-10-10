@@ -74,7 +74,7 @@ for dtype in ("float32", "float64", "float16", "bfloat16"):
         pair = {}
         for label, code in (("candidate", source), ("reference", reference)):
             (args.output / f"{name}-{label}.cu").write_text(code)
-            options = ["-std=c++17", f"-I{TILELANG_TEMPLATE_PATH}", f"-I{CUTLASS_INCLUDE_DIR}", f"-I{CUDA_HOME}/include/cccl"]
+            options = ["-std=c++20", f"-I{TILELANG_TEMPLATE_PATH}", f"-I{CUTLASS_INCLUDE_DIR}", f"-I{CUDA_HOME}/include/cccl"]
             ptx = bytes(compile_cuda(code, arch="sm_120", options=options)).decode()
             (args.output / f"{name}-{label}.ptx").write_text(ptx)
             pair[label] = body(ptx)
