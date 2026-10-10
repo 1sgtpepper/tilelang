@@ -13,13 +13,13 @@
 #define JOIN_IMPL(a, b) a##b
 #define JOIN(a, b) JOIN_IMPL(a, b)
 
-#if defined(PROBE_HYBRID) || defined(PROBE_XGATE)
+#if defined(PROBE_HYBRID) || defined(PROBE_ACTIVE)
 __device__ __forceinline__ float gated_sum(float value) {
   constexpr unsigned full = 0xffffffff;
 #ifdef PROBE_HYBRID
   if ((blockDim.x * blockDim.y * blockDim.z) % 32 != 0) {
 #else
-  if (blockDim.x % 32 != 0) {
+  if (__activemask() != full) {
 #endif
     const unsigned warp_mask = __ballot_sync(full, true);
     if (warp_mask != full) {
@@ -49,10 +49,14 @@ __global__ void JOIN(repeated_reduction_, PROBE_VARIANT)(
   const int rank = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
   const int index = blockIdx.x * (blockDim.x * blockDim.y * blockDim.z) + rank;
   float value = input[index];
+  if (iterations < 0) {
+    __nanosleep((rank % 32) * 100);
+    iterations = -iterations;
+  }
   const float increment = (rank % 2 + 1) * 0.015625f;
 #pragma unroll 1
   for (int iteration = 0; iteration < iterations; ++iteration) {
-#if defined(PROBE_HYBRID) || defined(PROBE_XGATE)
+#if defined(PROBE_HYBRID) || defined(PROBE_ACTIVE)
     value = gated_sum(value);
 #else
     value = tl::warp_reduce_sum(value);
@@ -71,13 +75,13 @@ using Launch = void (*)(const float *, float *, dim3, int, int);
 extern "C" void launch_baseline(const float *, float *, dim3, int, int);
 extern "C" void launch_hybrid(const float *, float *, dim3, int, int);
 extern "C" void launch_ballot(const float *, float *, dim3, int, int);
-extern "C" void launch_xgate(const float *, float *, dim3, int, int);
+extern "C" void launch_active(const float *, float *, dim3, int, int);
 
 int main() {
   constexpr int blocks = 128;
   constexpr int trials = 21;
-  const Launch launches[] = {launch_baseline, launch_ballot, launch_hybrid, launch_xgate};
-  const char *names[] = {"baseline", "ballot", "hybrid", "xgate"};
+  const Launch launches[] = {launch_baseline, launch_ballot, launch_hybrid, launch_active};
+  const char *names[] = {"baseline", "ballot", "hybrid", "active"};
   const std::vector<dim3> shapes = {dim3(32), dim3(64), dim3(128), dim3(256),
       dim3(1024), dim3(8, 8), dim3(4, 8, 2), dim3(7), dim3(24), dim3(48),
       dim3(7, 7), dim3(3, 3, 5)};
@@ -104,7 +108,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(input, host_input.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     for (int variant = first_variant; variant < 4; ++variant)
       CUDA_CHECK(cudaMalloc(&outputs[variant], count * sizeof(float)));
-    for (const int iterations : {1, 1024}) {
+    for (const int iterations : {1, 1024, -1}) {
       for (int warm = 0; warm < 10; ++warm)
         for (int variant = first_variant; variant < 4; ++variant)
           launches[variant](input, outputs[variant], shape, blocks, iterations);
@@ -133,7 +137,7 @@ int main() {
           std::fprintf(stderr, "NONFINITE_OUTPUT\n");
           return 1;
         }
-        if (iterations == 1) {
+        if (iterations == 1 || iterations == -1) {
           const int rank = index % threads;
           const size_t begin = index - rank % 32;
           const size_t end = std::min(begin + 32, index - rank + threads);
