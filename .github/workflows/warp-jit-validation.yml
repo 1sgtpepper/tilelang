@@ -19,6 +19,10 @@ on:
         description: Exact fork commit containing the helper fix and regression tests
         required: true
         type: string
+      softmax:
+        description: Also measure paired full-kernel softmax in header mode
+        type: boolean
+        default: false
 
 permissions:
   actions: read
@@ -101,6 +105,14 @@ jobs:
             source/src/tl_templates/cuda/nvrtc_std.h \
             source/testing/python/language/test_tilelang_language_warp_reduce.py
 
+      - name: Check out the softmax fixture
+        if: ${{ inputs.softmax }}
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          path: validation
+          persist-credentials: false
+
       - name: Verify pinned upstream wheel artifact
         env:
           GH_TOKEN: ${{ github.token }}
@@ -156,7 +168,7 @@ jobs:
           uv pip install --python "${RUNNER_TEMP}/tilelang-venv/bin/python" \
             'https://download-r2.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=5359b255ac68c0cabb8293952b38e00f0d1a570815cd87f19b61af702c071410'
           uv pip install --python "${RUNNER_TEMP}/tilelang-venv/bin/python" \
-            "$wheel" 'pytest>=6.2.4'
+            "$wheel" 'pytest==9.1.1' 'cuda-bindings==13.4.3'
 
       - name: Prepare external test and template trees
         run: |
@@ -389,6 +401,38 @@ jobs:
             src/tl_templates/cuda/reduce.h \
             testing/python/language/test_tilelang_language_warp_reduce.py \
             docs/programming_guides/instructions.md
+
+      - name: Measure paired whole-kernel softmax
+        if: ${{ inputs.softmax }}
+        working-directory: ${{ runner.temp }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t wheels < <(find "$RUNNER_TEMP/tile-wheelhouse" -maxdepth 1 -type f -name 'tilelang-*.whl' -print)
+          test "${#wheels[@]}" -eq 1
+          wheel=${wheels[0]}
+          baseline_sha=$(sha256sum "$RUNNER_TEMP/tile-templates-baseline/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
+          candidate_sha=$(sha256sum "$RUNNER_TEMP/tile-templates-patched/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
+          wheel_sha=$(sha256sum "$wheel" | cut -d' ' -f1)
+          "$RUNNER_TEMP/tilelang-venv/bin/python" \
+            "$GITHUB_WORKSPACE/validation/validation/warp-softmax-comparison.py" \
+            --baseline-template "$RUNNER_TEMP/tile-templates-baseline" \
+            --candidate-template "$RUNNER_TEMP/tile-templates-patched" \
+            --baseline-header-sha "$baseline_sha" --candidate-header-sha "$candidate_sha" \
+            --source-sha "$SOURCE_SHA" \
+            --wheel-source-sha adeea32bcecdddca32195a95e90730b175606a0e \
+            --wheel-path "$wheel" --wheel-sha "$wheel_sha" \
+            --output-dir "$RUNNER_TEMP/warp-softmax-$GITHUB_RUN_ID"
+
+      - name: Upload paired softmax evidence
+        if: ${{ always() && inputs.softmax }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: warp-softmax-comparison
+          path: ${{ runner.temp }}/warp-softmax-${{ github.run_id }}/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload validation logs
         if: always()
