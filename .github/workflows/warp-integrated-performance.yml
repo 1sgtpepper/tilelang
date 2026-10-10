@@ -135,8 +135,8 @@ jobs:
           "$RUNNER_TEMP/integrated-venv/bin/python" \
             "$GITHUB_WORKSPACE/validation/validation/warp-generated-extent-check.py" \
             "$INTEGRATED_OUTPUT/generated" \
-            "$RUNNER_TEMP/integrated-baseline/tl_templates/cuda/reduce.h" \
-            "$RUNNER_TEMP/integrated-ballot/tl_templates/cuda/reduce.h" \
+            "$RUNNER_TEMP/integrated-baseline" \
+            "$RUNNER_TEMP/integrated-ballot" \
             2>&1 | tee "$INTEGRATED_OUTPUT/generated.log"
       - name: Compare actual softmax and unchanged Engram kernels
         working-directory: ${{ runner.temp }}

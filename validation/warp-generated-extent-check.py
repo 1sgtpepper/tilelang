@@ -67,14 +67,13 @@ for dtype in ("float32", "float64", "float16", "bfloat16"):
         extents = functions[0].attrs["thread_extent"]
         assert math.prod(int(extents.get(f"threadIdx.{axis}", 1)) for axis in "xyz") == size
         reference = re.sub(r"(tl::warp_reduce_sum)<[^<>]+, [0-9]+>\(", r"\1(", source)
-        header = (args.baseline if full else args.ballot).resolve()
-        reference = reference.replace("#include <tl_templates/cuda/reduce.h>", f'#include "{header}"')
-        assert str(header) in reference
+        reference_root = (args.baseline if full else args.ballot).resolve()
+        reference_header = reference_root / "tl_templates/cuda/reduce.h"
         name = dtype + "-" + "x".join(map(str, shape))
         pair = {}
-        for label, code in (("candidate", source), ("reference", reference)):
+        for label, code, include_root in (("candidate", source, Path(TILELANG_TEMPLATE_PATH)), ("reference", reference, reference_root)):
             (args.output / f"{name}-{label}.cu").write_text(code)
-            options = ["-std=c++20", f"-I{TILELANG_TEMPLATE_PATH}", f"-I{CUTLASS_INCLUDE_DIR}", f"-I{CUDA_HOME}/include/cccl"]
+            options = ["-std=c++20", f"-I{include_root}", f"-I{CUTLASS_INCLUDE_DIR}", f"-I{CUDA_HOME}/include/cccl"]
             ptx = bytes(compile_cuda(code, arch="sm_120", options=options)).decode()
             (args.output / f"{name}-{label}.ptx").write_text(ptx)
             pair[label] = body(ptx)
@@ -89,6 +88,7 @@ for dtype in ("float32", "float64", "float16", "bfloat16"):
                 "shape": shape,
                 "block_threads": size,
                 "reference": "original-full" if full else "correct-tail",
+                "reference_header_sha256": hashlib.sha256(reference_header.read_bytes()).hexdigest(),
                 "normalized_ptx_identical": True,
                 "body_sha256": hashlib.sha256(pair["candidate"].encode()).hexdigest(),
             }
