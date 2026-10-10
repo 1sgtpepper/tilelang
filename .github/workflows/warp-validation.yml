@@ -11,12 +11,17 @@ on:
         required: true
         default: false
         type: boolean
+      sanitizer:
+        description: Check the exact helper with memory and synchronization tools
+        required: true
+        default: false
+        type: boolean
 permissions:
   contents: read
 jobs:
   header:
     runs-on: [self-hosted, linux, x64, warp-validation]
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -41,11 +46,17 @@ jobs:
           /usr/bin/g++-15 --version
           nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv,noheader
       - name: Compile exact CUDA header
+        env:
+          SANITIZER: ${{ inputs.sanitizer }}
         run: |
           set -euo pipefail
+          flags=()
+          if [[ "$SANITIZER" == true ]]; then
+            flags+=(-lineinfo)
+          fi
           cuda_nvcc=$(readlink -f "$(command -v nvcc)")
           cuda_root=$(dirname "$(dirname "$cuda_nvcc")")
-          "$cuda_nvcc" -std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 \
+          "$cuda_nvcc" -std=c++17 -O3 "${flags[@]}" -arch=sm_120 -ccbin /usr/bin/g++-15 \
             -I "$cuda_root/include/cccl" \
             -I source/src -I source/3rdparty/cutlass/include \
             validation/validation/warp-reduce-check.cu -o warp-reduce-check
@@ -65,10 +76,59 @@ jobs:
             grep -q '^CASES=' warp-results.log
           else
             test "$status" = 0
-            grep -q 'FAILURES=0' warp-results.log
+            grep -q '^CASES=5480 FAILURES=0$' warp-results.log
           fi
+      - name: Verify tool inputs and dump machine code
+        if: ${{ inputs.sanitizer }}
+        run: |
+          set -euo pipefail
+          mkdir -p tool-results
+          tools="$RUNNER_TOOL_CACHE/.warp-cache/tools"
+          mkdir -p "$tools"
+          sanitizer=cuda_sanitizer_api-linux-x86_64-13.3.27-archive
+          cuobjdump=cuda_cuobjdump-linux-x86_64-13.3.29-archive
+          for name in "$sanitizer" "$cuobjdump"; do
+            if [[ "$name" == "$sanitizer" ]]; then
+              component=cuda_sanitizer_api
+              digest=bed47e6b465653a8d4138bce412733131536f1a0e8ab306bb2b0a15f92fc68ff
+            else
+              component=cuda_cuobjdump
+              digest=9ac891072c4f9c2079cff8fdc3939ac97c5c5bcdf7cb5cca5a351354c7a8ff21
+            fi
+            archive="$tools/$name.tar.xz"
+            if [[ ! -f "$archive" ]]; then
+              curl --fail --location --retry 2 --output "$archive" \
+                "https://developer.download.nvidia.com/compute/cuda/redist/$component/linux-x86_64/$name.tar.xz"
+            fi
+            printf '%s  %s\n' "$digest" "$archive" | sha256sum --check
+            tar -xJf "$archive" -C "$tools"
+            sha256sum "$archive" >> tool-results/tool-inputs.sha256
+          done
+          "$tools/$sanitizer/compute-sanitizer/compute-sanitizer" --version \
+            > tool-results/sanitizer-version.txt
+          "$tools/$cuobjdump/bin/cuobjdump" --version > tool-results/cuobjdump-version.txt
+          sha256sum warp-reduce-check source/src/tl_templates/cuda/reduce.h \
+            validation/validation/warp-reduce-check.cu > tool-results/source-and-binary.sha256
+          "$tools/$cuobjdump/bin/cuobjdump" --dump-resource-usage warp-reduce-check \
+            > tool-results/resources.txt
+          "$tools/$cuobjdump/bin/cuobjdump" --dump-sass warp-reduce-check \
+            > tool-results/sass.txt
+      - name: Run memory and synchronization checks
+        if: ${{ inputs.sanitizer }}
+        run: |
+          set -euo pipefail
+          sanitizer="$RUNNER_TOOL_CACHE/.warp-cache/tools/cuda_sanitizer_api-linux-x86_64-13.3.27-archive/compute-sanitizer/compute-sanitizer"
+          for tool in memcheck synccheck; do
+            "$sanitizer" --tool "$tool" --error-exitcode 7 ./warp-reduce-check \
+              > "tool-results/$tool.txt" 2>&1
+            grep -q '^CASES=5480 FAILURES=0$' "tool-results/$tool.txt"
+            grep -q '^========= ERROR SUMMARY: 0 errors' "tool-results/$tool.txt"
+            tail -n 4 "tool-results/$tool.txt"
+          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: warp-validation-results
-          path: warp-results.log
+          path: |
+            warp-results.log
+            tool-results/
