@@ -1,4 +1,4 @@
-"""Paired CUDA-graph timing for a CI-only TileLang warp-softmax microkernel."""
+"""Paired CUDA-graph timing for warp softmax or an unchanged Engram consumer."""
 
 from __future__ import annotations
 
@@ -16,7 +16,9 @@ from pathlib import Path
 from statistics import median
 
 BASELINE_HEADER_COMMIT = "194c1b897aa5269e9a89d44c88efdf578a3df620"
+CONSUMER_COMMIT = "66258df6175d2f630ffecb04c5ab66bff8a2ae6a"
 ROWS, WIDTH, THREADS = 32768, 32, 128
+ENGRAM_TOKENS, ENGRAM_HC, ENGRAM_HIDDEN = 8001, 4, 4096
 ROWS_PER_CTA = THREADS // WIDTH
 GRAPH_LAUNCHES = 128
 WARMUPS, PAIRS = 10, 21
@@ -129,40 +131,94 @@ def worker(config: dict) -> int:
     if file_sha(template / HEADER) != config["header_sha"]:
         raise ValueError("worker reduce.h hash mismatch")
 
-    input_path = Path(config["input_path"]).resolve(strict=True)
-    input_sha = file_sha(input_path)
-    if input_sha != config["input_sha"]:
-        raise ValueError("shared input bytes do not match the recorded SHA-256")
-    cpu = torch.from_file(str(input_path), shared=False, size=ROWS * WIDTH, dtype=torch.float32).reshape(ROWS, WIDTH)
-    x, y = cpu.to("cuda"), torch.empty((ROWS, WIDTH), dtype=torch.float32, device="cuda")
+    inputs = {}
+    for name, spec in config["inputs"].items():
+        path = Path(spec["path"]).resolve(strict=True)
+        if file_sha(path) != spec["sha256"] or spec["dtype"] not in ("float32", "bfloat16"):
+            raise ValueError(f"shared {name} bytes or dtype do not match their provenance")
+        dtype = getattr(torch, spec["dtype"])
+        count = math.prod(spec["shape"])
+        if path.stat().st_size != count * torch.empty((), dtype=dtype).element_size():
+            raise ValueError(f"shared {name} has the wrong byte count")
+        cpu = torch.from_file(str(path), shared=False, size=count, dtype=dtype).reshape(spec["shape"])
+        inputs[name] = cpu.to("cuda")
+    del cpu
+    x = inputs["x"]
     default_stream = torch.cuda.current_stream()
-    reference = torch.softmax(x, dim=-1)
+    if config["workload"] == "engram":
+        consumer = Path(config["consumer_root"]).resolve(strict=True)
+        for name, digest in config["consumer_files"].items():
+            if file_sha(consumer / name) != digest:
+                raise ValueError(f"consumer source hash differs: {name}")
+        sys.path.insert(0, str(consumer))
+        import tile_kernels
+        from tile_kernels.config import get_num_sms, get_pdl
+        from tile_kernels.engram import engram_gate_fwd
+        from tile_kernels.engram.engram_gate_fwd_cuda import get_engram_gate_fwd_kernel_cuda
+        from tile_kernels.torch.engram import engram_gate_ref
+
+        if not Path(tile_kernels.__file__).resolve().is_relative_to(consumer / "tile_kernels") or get_pdl():
+            raise ValueError("consumer import or default PDL policy differs from the pinned source")
+        torch.cuda.reset_peak_memory_stats()
+        kv, wh, we = (inputs[name] for name in ("kv", "wh", "we"))
+        weight = wh.float() * we.float()
+        reference = torch.empty_like(x)
+        # Tokens are independent in the upstream reference; bound its temporaries.
+        for begin in range(0, ENGRAM_TOKENS, 512):
+            end = min(begin + 512, ENGRAM_TOKENS)
+            reference[begin:end] = engram_gate_ref(x[begin:end], kv[begin:end], wh, we, 1e-6, 1e-20)
+        y, *saved = engram_gate_fwd(x, kv, weight, 1e-20, 1e-6, save_for_backward=False)
+        if saved != [None] * 4:
+            raise AssertionError("inference wrapper unexpectedly saved backward outputs")
+        torch.testing.assert_close(y, reference, rtol=8e-3, atol=8e-3)
+        kernel = get_engram_gate_fwd_kernel_cuda(
+            ENGRAM_HIDDEN, 1e-20, ENGRAM_HIDDEN**-0.5, get_num_sms(), 1e-6, ENGRAM_HC, False, False, False, use_pdl=False
+        )
+        if kernel.execution_backend != "tvm_ffi":
+            raise ValueError(f"expected the consumer's default FFI backend, got {kernel.execution_backend}")
+        kernel_args = (x, kv, weight, None, y, None, None, None, None)
+        rtol = atol = 8e-3
+        calls = {"tl::warp_reduce_sum(": 3}
+        # This is a separate same-source compile inspection, not the timed binary.
+        ptx = kernel._get_ptx()
+        if ".target sm_120" not in ptx or (config["variant"] == "candidate" and "vote.sync.ballot" not in ptx):
+            raise AssertionError("auxiliary PTX does not exercise the expected SM120 fallback")
+        Path(config["output_dir"], f"{variant}-auxiliary.ptx").write_text(ptx, encoding="utf-8")
+    elif config["workload"] == "softmax":
+        y = torch.empty_like(x)
+        reference = torch.softmax(x, dim=-1)
+        kernel = tilelang.compile(softmax_func(T), out_idx=[], execution_backend="nvrtc")
+        kernel_args = (x, y)
+        rtol, atol = RTOL, ATOL
+        calls = {"tl::warp_reduce_max(": 1, "tl::warp_reduce_sum(": 1}
+    else:
+        raise ValueError(f"unknown workload: {config['workload']}")
     stream = torch.cuda.Stream()
     stream.wait_stream(default_stream)
+    launch_options = {"stream": stream.cuda_stream} if config["workload"] == "softmax" else {}
 
-    kernel = tilelang.compile(softmax_func(T), out_idx=[], execution_backend="nvrtc")
     source = kernel.get_kernel_source()
-    calls = ("tl::warp_reduce_max(", "tl::warp_reduce_sum(")
-    if any(source.count(call) != 1 for call in calls):
-        raise ValueError("generated source must contain exactly one max and one sum helper call")
+    if any(source.count(call) != count for call, count in calls.items()):
+        raise ValueError("generated source does not contain the workload's exact direct helper calls")
     source_bytes = source.encode("utf-8")
     source_path = Path(config["output_dir"]) / f"{variant}-kernel.cu"
     source_path.write_bytes(source_bytes)
 
-    x.record_stream(stream)
-    y.record_stream(stream)
+    for tensor in kernel_args:
+        if isinstance(tensor, torch.Tensor):
+            tensor.record_stream(stream)
     with torch.cuda.stream(stream):
-        kernel(x, y, stream=stream.cuda_stream)
+        kernel(*kernel_args, **launch_options)
     stream.synchronize()
     default_stream.wait_stream(stream)
     if not torch.isfinite(y).all().item():
-        raise AssertionError(f"{variant} softmax returned non-finite values")
-    torch.testing.assert_close(y, reference, rtol=RTOL, atol=ATOL)
+        raise AssertionError(f"{variant} {config['workload']} returned non-finite values")
+    torch.testing.assert_close(y, reference, rtol=rtol, atol=atol)
 
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
         for _ in range(GRAPH_LAUNCHES):
-            kernel(x, y, stream=stream.cuda_stream)
+            kernel(*kernel_args, **launch_options)
     stream.synchronize()
     result, _, node_count = runtime.cudaGraphGetNodes(graph.raw_cuda_graph(), numNodes=0)
     if result != runtime.cudaError_t.cudaSuccess or node_count != GRAPH_LAUNCHES:
@@ -181,7 +237,7 @@ def worker(config: dict) -> int:
         y.fill_(float("nan"))
         graph.replay()
     stream.synchronize()
-    torch.testing.assert_close(y, reference, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(y, reference, rtol=rtol, atol=atol)
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     nvrtc_result, nvrtc_major, nvrtc_minor = nvrtc.nvrtcVersion()
     if nvrtc_result != nvrtc.nvrtcResult.NVRTC_SUCCESS:
@@ -194,7 +250,10 @@ def worker(config: dict) -> int:
         "reduce_header_commit": header_commit,
         "reduce_header_sha256": config["header_sha"],
         "wheel_sha256": config["wheel_sha"],
-        "input_sha256": input_sha,
+        "input_sha256": {name: spec["sha256"] for name, spec in config["inputs"].items()},
+        "workload": config["workload"],
+        "consumer_commit": CONSUMER_COMMIT if config["workload"] == "engram" else None,
+        "execution_backend": kernel.execution_backend,
         "generated_cuda_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "generated_cuda_path": str(source_path),
         "tilelang_path": str(package_path),
@@ -206,18 +265,26 @@ def worker(config: dict) -> int:
         "gpu_name": torch.cuda.get_device_name(),
         "compute_capability": list(torch.cuda.get_device_capability()),
         "jit_cache_disabled": True,
-        "shape": [ROWS, WIDTH],
-        "threads_per_cta": THREADS,
-        "rows_per_cta": ROWS_PER_CTA,
+        "shape": list(y.shape),
+        "output_dtype": "bfloat16" if config["workload"] == "engram" else "float32",
+        "threads_per_cta": 32 if config["workload"] == "engram" else THREADS,
+        "rtol": rtol,
+        "atol": atol,
         "graph_launches_per_sample": GRAPH_LAUNCHES,
         "captured_kernel_nodes": node_count,
         "graph_replay_regenerated_nan_filled_output": True,
         "warmup_graph_replays": WARMUPS,
         "untimed_graph_replays_immediately_before_each_sample": 1,
         "cache_policy": "repeated graph over reused input/output buffers; no flush or cache-residency claim",
-        "max_abs_error_vs_torch_softmax": (y - reference).abs().max().item(),
-        "output_path": str(Path(config["output_dir"]) / f"{variant}-output.f32"),
+        "max_abs_error_vs_upstream_torch_reference": (y.float() - reference.float()).abs().max().item(),
+        "output_path": str(Path(config["output_dir"]) / f"{variant}-output.bin"),
     }
+    metadata["peak_gpu_allocated_bytes"] = torch.cuda.max_memory_allocated()
+    metadata["peak_gpu_reserved_bytes"] = torch.cuda.max_memory_reserved()
+    if config["workload"] == "engram":
+        # Release reference temporaries' free blocks before the second worker's peak.
+        torch.cuda.empty_cache()
+    metadata["gpu_free_bytes_at_ready"], metadata["gpu_total_bytes"] = torch.cuda.mem_get_info()
     Path(config["output_dir"], f"{variant}-metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -244,8 +311,8 @@ def worker(config: dict) -> int:
             protocol({"kind": "SAMPLE", "variant": variant, "elapsed_ms": elapsed_ms})
         elif command == "STOP":
             stream.synchronize()
-            torch.testing.assert_close(y, reference, rtol=RTOL, atol=ATOL)
-            raw = y.detach().cpu().contiguous().numpy().tobytes()
+            torch.testing.assert_close(y, reference, rtol=rtol, atol=atol)
+            raw = y.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
             Path(metadata["output_path"]).write_bytes(raw)
             metadata["output_sha256_after_timing"] = hashlib.sha256(raw).hexdigest()
             Path(config["output_dir"], f"{variant}-metadata.json").write_text(
@@ -324,11 +391,39 @@ def controller(args: argparse.Namespace) -> int:
         raise FileExistsError(f"refusing to overwrite benchmark evidence in {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    input = torch.randn((ROWS, WIDTH), generator=torch.Generator(device="cpu").manual_seed(INPUT_SEED))
-    input_path = output_dir / "input-f32.bin"
-    input_bytes = input.numpy().tobytes()
-    input_path.write_bytes(input_bytes)
-    input_sha = hashlib.sha256(input_bytes).hexdigest()
+    consumer_files = {}
+    if args.workload == "engram":
+        if args.consumer_root is None:
+            raise ValueError("Engram requires the pinned consumer checkout")
+        consumer = args.consumer_root.resolve(strict=True)
+        actual = subprocess.run(
+            ["git", "-C", str(consumer), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+        status = subprocess.run(["git", "-C", str(consumer), "status", "--porcelain"], check=True, capture_output=True, text=True).stdout
+        if actual != CONSUMER_COMMIT or status:
+            raise ValueError("consumer checkout is not the clean pinned source")
+        files = [consumer / "LICENSE", consumer / "pyproject.toml", *sorted((consumer / "tile_kernels").rglob("*.py"))]
+        consumer_files = {path.relative_to(consumer).as_posix(): file_sha(path) for path in files}
+        shapes = {
+            "x": (ENGRAM_TOKENS, ENGRAM_HC, ENGRAM_HIDDEN),
+            "kv": (ENGRAM_TOKENS, ENGRAM_HC + 1, ENGRAM_HIDDEN),
+            "wh": (ENGRAM_HC, ENGRAM_HIDDEN),
+            "we": (ENGRAM_HC, ENGRAM_HIDDEN),
+        }
+        dtype_name = "bfloat16"
+    elif args.consumer_root is not None:
+        raise ValueError("softmax does not use a consumer checkout")
+    else:
+        shapes, dtype_name = {"x": (ROWS, WIDTH)}, "float32"
+    generator = torch.Generator(device="cpu").manual_seed(INPUT_SEED)
+    inputs = {}
+    for name, shape in shapes.items():
+        tensor = torch.randn(shape, generator=generator, dtype=getattr(torch, dtype_name))
+        input_bytes = tensor.contiguous().view(torch.uint8).numpy().tobytes()
+        path = output_dir / f"input-{name}.bin"
+        path.write_bytes(input_bytes)
+        inputs[name] = {"path": str(path), "sha256": hashlib.sha256(input_bytes).hexdigest(), "shape": list(shape), "dtype": dtype_name}
+    del tensor, input_bytes
     device_query = telemetry(
         "name,compute_cap,memory.total,driver_version",
         ("gpu_name", "compute_cap", "memory_total", "driver_version"),
@@ -347,11 +442,11 @@ def controller(args: argparse.Namespace) -> int:
         "candidate_reduce_header_sha256": args.candidate_header_sha,
         "wheel_path": str(wheel_path),
         "wheel_sha256": args.wheel_sha,
-        "input_path": str(input_path),
-        "input_sha256": input_sha,
+        "inputs": inputs,
         "input_seed": INPUT_SEED,
-        "input_shape": [ROWS, WIDTH],
-        "input_dtype": "float32",
+        "workload": args.workload,
+        "consumer_commit": CONSUMER_COMMIT if args.workload == "engram" else None,
+        "consumer_files": consumer_files,
         "gpu": device_query,
         "gpu_state_before_workers": before_workers,
     }
@@ -367,8 +462,10 @@ def controller(args: argparse.Namespace) -> int:
                 "source_sha": args.source_sha,
                 "wheel_source_sha": args.wheel_source_sha,
                 "wheel_sha": args.wheel_sha,
-                "input_path": str(input_path),
-                "input_sha": input_sha,
+                "inputs": inputs,
+                "workload": args.workload,
+                "consumer_root": str(args.consumer_root.resolve()) if args.consumer_root else None,
+                "consumer_files": consumer_files,
                 "output_dir": str(output_dir),
             }
             config_path = output_dir / f"{variant}-worker.json"
@@ -398,6 +495,11 @@ def controller(args: argparse.Namespace) -> int:
             "compute_capability",
             "generated_cuda_sha256",
             "input_sha256",
+            "workload",
+            "consumer_commit",
+            "execution_backend",
+            "shape",
+            "output_dtype",
         ):
             if ready["baseline"][key] != ready["candidate"][key]:
                 raise ValueError(f"baseline and candidate runtime/source differ in {key}")
@@ -457,9 +559,12 @@ def controller(args: argparse.Namespace) -> int:
             status = workers[variant].wait(timeout=10)
             if status != 0:
                 raise RuntimeError(f"{variant} worker exited with status {status}")
-        a = torch.from_file(done["baseline"]["output_path"], shared=False, size=ROWS * WIDTH, dtype=torch.float32)
-        b = torch.from_file(done["candidate"]["output_path"], shared=False, size=ROWS * WIDTH, dtype=torch.float32)
-        torch.testing.assert_close(a, b, rtol=RTOL, atol=ATOL)
+        count = math.prod(ready["baseline"]["shape"])
+        dtype = getattr(torch, ready["baseline"]["output_dtype"])
+        a = torch.from_file(done["baseline"]["output_path"], shared=False, size=count, dtype=dtype)
+        b = torch.from_file(done["candidate"]["output_path"], shared=False, size=count, dtype=dtype)
+        torch.testing.assert_close(a, b, rtol=ready["baseline"]["rtol"], atol=ready["baseline"]["atol"])
+        output_bytes_equal = done["baseline"]["output_sha256_after_timing"] == done["candidate"]["output_sha256_after_timing"]
         env_flags = []
         start_util = before_workers["numeric"]["utilization_gpu"]
         if start_util is None or start_util >= 20:
@@ -479,10 +584,11 @@ def controller(args: argparse.Namespace) -> int:
         report["assessment"] = "INCONCLUSIVE_ENVIRONMENT" if env_flags else report["statistical_assessment"]
         report.update(
             {
-                "fixture": "CI-only public-API row-softmax microkernel; no in-tree example or application-wide claim",
-                "rows": ROWS,
-                "width": WIDTH,
-                "threads_per_cta": THREADS,
+                "fixture": "unchanged upstream TileKernels Engram CUDA kernel; no model-wide claim"
+                if args.workload == "engram"
+                else "CI-only public-API row-softmax microkernel; no in-tree example or application-wide claim",
+                "output_shape": ready["baseline"]["shape"],
+                "threads_per_cta": ready["baseline"]["threads_per_cta"],
                 "graph_launches_per_sample": GRAPH_LAUNCHES,
                 "warmup_graph_replays_per_variant": WARMUPS,
                 "untimed_graph_replays_immediately_before_each_sample": 1,
@@ -501,7 +607,12 @@ def controller(args: argparse.Namespace) -> int:
                 },
                 "samples_discarded": 0,
                 "clocks_modified": False,
-                "output_agreement": {"passed": True, "rtol": RTOL, "atol": ATOL},
+                "output_agreement": {
+                    "passed": True,
+                    "bytes_equal": output_bytes_equal,
+                    "rtol": ready["baseline"]["rtol"],
+                    "atol": ready["baseline"]["atol"],
+                },
             }
         )
         (output_dir / "summary.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -523,6 +634,8 @@ def controller(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker-config", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--workload", choices=("softmax", "engram"), default="softmax")
+    parser.add_argument("--consumer-root", type=Path)
     parser.add_argument("--baseline-template", type=Path)
     parser.add_argument("--candidate-template", type=Path)
     parser.add_argument("--baseline-header-sha")

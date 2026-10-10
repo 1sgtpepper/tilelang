@@ -8,12 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       validation_kind:
-        description: Select header-overlay or exact-source wheel validation
+        description: Select header, exact-source wheel, or consumer validation
         required: true
         type: choice
         options:
           - header
           - wheel
+          - consumer
         default: header
       source_sha:
         description: Exact fork commit containing the helper fix and regression tests
@@ -34,7 +35,7 @@ concurrency:
 
 jobs:
   cuda:
-    if: ${{ inputs.validation_kind != 'wheel' }}
+    if: ${{ inputs.validation_kind == 'header' }}
     runs-on: [self-hosted, linux, x64, warp-validation]
     timeout-minutes: 35
     env:
@@ -463,6 +464,199 @@ jobs:
         with:
           name: warp-reduction-jit-results
           path: jit-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+  consumer:
+    if: ${{ inputs.validation_kind == 'consumer' }}
+    name: Compare the unchanged Engram CUDA kernel
+    runs-on: [self-hosted, linux, x64, warp-validation]
+    timeout-minutes: 35
+    env:
+      CUDA_HOME: /home/sgtpepper/.local/cuda-13.3
+      NVCC_CCBIN: /usr/bin/g++-15
+      CXX: /usr/bin/g++-15
+      TILELANG_DISABLE_CACHE: "1"
+      UV_HTTP_TIMEOUT: "300"
+      UV_CONCURRENT_DOWNLOADS: "3"
+      PYTHONPATH: ""
+    steps:
+      - name: Check out exact reducer source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out comparison fixture
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          path: validation
+          persist-credentials: false
+
+      - name: Check out pinned consumer
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: deepseek-ai/TileKernels
+          ref: 66258df6175d2f630ffecb04c5ab66bff8a2ae6a
+          path: consumer
+          persist-credentials: false
+
+      - name: Verify the reusable exact-source wheel artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_SHA" = 5fe3f25fe9af1ff4b1d36f8814918a967d036f85
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          metadata=$(gh api repos/1sgtpepper/tilelang/actions/artifacts/11657493986 \
+            --jq '[.id, .name, .size_in_bytes, .digest, (.expired | tostring), .workflow_run.head_sha] | @tsv')
+          expected=$(printf '%s\t%s\t%s\t%s\t%s\t%s' \
+            11657493986 tilelang-native-wheel 45831485 \
+            sha256:0dfe4219c6d2e609b7e9a2c2466f6f48bf5b34516c629b5a10f6e30dd1ecc2d1 \
+            false 63e35cfa83573a763a6257eb9432ee0386d6928b)
+          test "$metadata" = "$expected"
+
+      - name: Download the verified native wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: tilelang-native-wheel
+          run-id: 38019827361
+          repository: 1sgtpepper/tilelang
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/consumer-wheelhouse
+
+      - name: Reuse the CUDA and Python dependency caches
+        run: |
+          set -euo pipefail
+          command -v uv
+          uv python find 3.12
+          echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
+          echo "UV_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/uv" >> "$GITHUB_ENV"
+          echo "PIP_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/pip" >> "$GITHUB_ENV"
+
+      - name: Install the exact wheel and prepare two header trees
+        working-directory: ${{ runner.temp }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          unset TL_TEMPLATE_PATH PYTHONPATH
+          output="$RUNNER_TEMP/warp-consumer-$GITHUB_RUN_ID"
+          mkdir -p "$output"
+          test "$(cat "$RUNNER_TEMP/consumer-wheelhouse/source-sha.txt")" = "$SOURCE_SHA"
+          (cd "$GITHUB_WORKSPACE" && sha256sum -c \
+            "$RUNNER_TEMP/consumer-wheelhouse/source-files.sha256")
+          (cd "$RUNNER_TEMP/consumer-wheelhouse" && sha256sum -c wheel.sha256)
+          mapfile -t wheels < <(find "$RUNNER_TEMP/consumer-wheelhouse" -maxdepth 1 -name 'tilelang-*.whl' -print)
+          test "${#wheels[@]}" -eq 1
+          wheel=${wheels[0]}
+          test "$(sha256sum "$wheel" | cut -d' ' -f1)" = e6c3976e9edd8f661c68125b130e7284304e01b26e2e93d3cf88d79fe9287588
+          uv venv --python 3.12 "$RUNNER_TEMP/tilelang-consumer-venv"
+          uv pip install --python "$RUNNER_TEMP/tilelang-consumer-venv/bin/python" \
+            'https://download-r2.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=5359b255ac68c0cabb8293952b38e00f0d1a570815cd87f19b61af702c071410'
+          uv pip install --python "$RUNNER_TEMP/tilelang-consumer-venv/bin/python" \
+            "$wheel" 'pytest==9.1.1' 'cuda-bindings==13.4.3'
+          "$RUNNER_TEMP/tilelang-consumer-venv/bin/python" - <<'PY'
+          import hashlib, sys
+          from pathlib import Path
+          import tilelang
+          from tilelang.env import TILELANG_TEMPLATE_PATH
+          package = Path(tilelang.__file__).resolve()
+          assert package.is_relative_to(Path(sys.prefix).resolve()), package
+          assert Path(TILELANG_TEMPLATE_PATH).resolve() == package.parent / "src"
+          actual = hashlib.sha256(Path(TILELANG_TEMPLATE_PATH, "tl_templates/cuda/reduce.h").read_bytes()).hexdigest()
+          assert actual == "c0a751635c86f17c8a2a9c874c5473924a544894454ede1ddb5ff2b458a5dd00", actual
+          print(f"installed_package={package} installed_header_sha256={actual}")
+          PY
+          mkdir -p "$RUNNER_TEMP/consumer-template-baseline" "$RUNNER_TEMP/consumer-template-candidate"
+          cp -a "$GITHUB_WORKSPACE/source/src/." "$RUNNER_TEMP/consumer-template-baseline/"
+          cp -a "$GITHUB_WORKSPACE/source/src/." "$RUNNER_TEMP/consumer-template-candidate/"
+          git -C "$GITHUB_WORKSPACE/source" show \
+            194c1b897aa5269e9a89d44c88efdf578a3df620:src/tl_templates/cuda/reduce.h \
+            > "$RUNNER_TEMP/consumer-template-baseline/tl_templates/cuda/reduce.h"
+          nvcc --version > "$output/nvcc.txt"
+          /usr/bin/g++-15 --version > "$output/cxx.txt"
+          uv pip list --python "$RUNNER_TEMP/tilelang-consumer-venv/bin/python" --format=json \
+            > "$output/packages.json"
+          git -C "$GITHUB_WORKSPACE/consumer" rev-parse HEAD > "$output/consumer-commit.txt"
+          cp "$GITHUB_WORKSPACE/consumer/LICENSE" "$output/consumer-license.txt"
+          sha256sum "$GITHUB_WORKSPACE/validation/validation/warp-softmax-comparison.py" \
+            > "$output/fixture.sha256"
+
+      - name: Validate and measure the actual Engram kernel
+        working-directory: ${{ runner.temp }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          wheel=$(find "$RUNNER_TEMP/consumer-wheelhouse" -maxdepth 1 -name 'tilelang-*.whl' -print)
+          baseline_sha=$(sha256sum "$RUNNER_TEMP/consumer-template-baseline/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
+          candidate_sha=$(sha256sum "$RUNNER_TEMP/consumer-template-candidate/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
+          output="$RUNNER_TEMP/warp-consumer-$GITHUB_RUN_ID"
+          "$RUNNER_TEMP/tilelang-consumer-venv/bin/python" \
+            "$GITHUB_WORKSPACE/validation/validation/warp-softmax-comparison.py" \
+            --workload engram --consumer-root "$GITHUB_WORKSPACE/consumer" \
+            --baseline-template "$RUNNER_TEMP/consumer-template-baseline" \
+            --candidate-template "$RUNNER_TEMP/consumer-template-candidate" \
+            --baseline-header-sha "$baseline_sha" --candidate-header-sha "$candidate_sha" \
+            --source-sha "$SOURCE_SHA" --wheel-source-sha "$SOURCE_SHA" \
+            --wheel-path "$wheel" --wheel-sha e6c3976e9edd8f661c68125b130e7284304e01b26e2e93d3cf88d79fe9287588 \
+            --output-dir "$output/measurement" 2>&1 | tee "$output/comparison.log"
+
+      - name: Check the preserved softmax role and empty-graph rejection
+        working-directory: ${{ runner.temp }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          wheel=$(find "$RUNNER_TEMP/consumer-wheelhouse" -maxdepth 1 -name 'tilelang-*.whl' -print)
+          baseline_sha=$(sha256sum "$RUNNER_TEMP/consumer-template-baseline/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
+          candidate_sha=$(sha256sum "$RUNNER_TEMP/consumer-template-candidate/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
+          output="$RUNNER_TEMP/warp-consumer-$GITHUB_RUN_ID"
+          script="$GITHUB_WORKSPACE/validation/validation/warp-softmax-comparison.py"
+          args=(
+            --baseline-template "$RUNNER_TEMP/consumer-template-baseline"
+            --candidate-template "$RUNNER_TEMP/consumer-template-candidate"
+            --baseline-header-sha "$baseline_sha" --candidate-header-sha "$candidate_sha"
+            --source-sha "$SOURCE_SHA" --wheel-source-sha "$SOURCE_SHA"
+            --wheel-path "$wheel" --wheel-sha e6c3976e9edd8f661c68125b130e7284304e01b26e2e93d3cf88d79fe9287588
+          )
+          "$RUNNER_TEMP/tilelang-consumer-venv/bin/python" - "$script" "$RUNNER_TEMP/consumer-empty-capture.py" <<'PY'
+          from pathlib import Path
+          import sys
+          source = Path(sys.argv[1]).read_text()
+          correct = "torch.cuda.graph(graph, stream=stream)"
+          assert source.count(correct) == 1
+          Path(sys.argv[2]).write_text(source.replace(correct, "torch.cuda.graph(graph)"))
+          PY
+          if "$RUNNER_TEMP/tilelang-consumer-venv/bin/python" "$RUNNER_TEMP/consumer-empty-capture.py" \
+            "${args[@]}" --output-dir "$output/negative-capture" > "$output/negative-capture.log" 2>&1; then
+            echo 'Empty-capture negative control unexpectedly passed' >&2
+            exit 1
+          fi
+          "$RUNNER_TEMP/tilelang-consumer-venv/bin/python" - "$output/negative-capture.log" <<'PY'
+          from pathlib import Path
+          import sys
+          log = Path(sys.argv[1]).read_text()
+          assert "expected 128 captured kernel nodes; got 0" in log, log
+          print("EMPTY_CAPTURE_NEGATIVE_CONTROL_FAILED_AS_EXPECTED")
+          PY
+          "$RUNNER_TEMP/tilelang-consumer-venv/bin/python" "$script" \
+            "${args[@]}" --output-dir "$output/softmax-replay" 2>&1 | tee "$output/softmax-replay.log"
+
+      - name: Upload consumer provenance and raw timing evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: warp-consumer-comparison
+          path: |
+            ${{ runner.temp }}/warp-consumer-${{ github.run_id }}/
+            !${{ runner.temp }}/warp-consumer-${{ github.run_id }}/**/input-*.bin
+            !${{ runner.temp }}/warp-consumer-${{ github.run_id }}/**/*-output.bin
           if-no-files-found: warn
           retention-days: 7
 
