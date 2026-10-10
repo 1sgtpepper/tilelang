@@ -172,6 +172,7 @@ jobs:
             validation/validation/warp-codegen-check.py \
             > "$PROBE_RESULTS/codegen/pruned-codegen-check.txt" <<'PY'
           import importlib.util
+          import re
           import sys
           from pathlib import Path
 
@@ -186,7 +187,22 @@ jobs:
               return result
 
           def metrics(variant, target, kernel):
-              return checker.inspect(body(variant, target, kernel))
+              text = body(variant, target, kernel)
+              result = checker.inspect(text)
+              for mode in ("bfly", "idx"):
+                  for item in result["shuffle_operands"][mode]:
+                      operand = item["lane_or_delta"]
+                      if not operand.startswith("%"):
+                          continue
+                      register = re.escape(operand)
+                      writes = re.findall(
+                          rf"(?m)^\s*(?:@!?%[\w$]+\s+)?[\w.]+\s+{register}(?:\||,)", text)
+                      constants = re.findall(
+                          rf"(?m)^\s*mov\.(?:u32|b32)\s+{register},\s*([0-9]+);", text)
+                      if len(writes) != 1 or len(constants) != 1:
+                          raise SystemExit(f"{target} {kernel}: non-constant {mode} source {operand}")
+                      item["lane_or_delta"] = constants[0]
+              return result
 
           checked = []
           for target in ("sm_75", "sm_120", "sm_100a", "sm_100f"):
