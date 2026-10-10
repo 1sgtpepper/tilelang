@@ -686,7 +686,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          BASELINE_SHA=194c1b897aa5269e9a89d44c88efdf578a3df620
+          BASELINE_SHA=ebb0de0d81abde83948238f361efda6fb0d745da
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
           git -C source cat-file -e "${BASELINE_SHA}^{commit}"
@@ -907,7 +907,7 @@ jobs:
           set -euo pipefail
           unset TL_TEMPLATE_PATH PYTHONPATH
           mkdir -p "$GITHUB_WORKSPACE/wheel-results"
-          BASELINE_SHA=194c1b897aa5269e9a89d44c88efdf578a3df620
+          BASELINE_SHA=ebb0de0d81abde83948238f361efda6fb0d745da
           test "$(git -C "$GITHUB_WORKSPACE/source" rev-parse HEAD)" = "$SOURCE_SHA"
           git -C "$GITHUB_WORKSPACE/source" merge-base --is-ancestor \
             "$BASELINE_SHA" "$SOURCE_SHA"
