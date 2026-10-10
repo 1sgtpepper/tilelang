@@ -99,10 +99,10 @@ jobs:
         run: |
           set -euo pipefail
           unset TL_TEMPLATE_PATH PYTHONPATH
-          cp "$GITHUB_WORKSPACE/source/testing/python/language/test_tilelang_language_warp_reduce.py" "$RUNNER_TEMP/integrated-reduction-tests.py"
-          cp "$GITHUB_WORKSPACE/source/testing/python/jit/test_tilelang_jit_nvrtc_std.py" "$RUNNER_TEMP/integrated-nvrtc-tests.py"
+          cp "$GITHUB_WORKSPACE/source/testing/python/language/test_tilelang_language_warp_reduce.py" "$RUNNER_TEMP/test_tilelang_language_warp_reduce.py"
+          cp "$GITHUB_WORKSPACE/source/testing/python/jit/test_tilelang_jit_nvrtc_std.py" "$RUNNER_TEMP/test_tilelang_jit_nvrtc_std.py"
           "$RUNNER_TEMP/integrated-venv/bin/python" -m pytest -q \
-            "$RUNNER_TEMP/integrated-reduction-tests.py" "$RUNNER_TEMP/integrated-nvrtc-tests.py" \
+            "$RUNNER_TEMP/test_tilelang_language_warp_reduce.py" "$RUNNER_TEMP/test_tilelang_jit_nvrtc_std.py" \
             --junitxml="$INTEGRATED_OUTPUT/tests.xml" 2>&1 | tee "$INTEGRATED_OUTPUT/tests.log"
           "$RUNNER_TEMP/integrated-venv/bin/python" - "$INTEGRATED_OUTPUT/tests.xml" <<'PY'
           import sys, xml.etree.ElementTree as ET
