@@ -13,6 +13,31 @@
 #define JOIN_IMPL(a, b) a##b
 #define JOIN(a, b) JOIN_IMPL(a, b)
 
+#ifdef PROBE_DIRECT_GEOMETRY
+__device__ __forceinline__ float direct_geometry_sum(float value) {
+  const int thread_idx = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+  const int block_threads = blockDim.x * blockDim.y * blockDim.z;
+  const int warp_threads = block_threads - (thread_idx & ~31);
+  if (warp_threads < 32) {
+    const unsigned mask = (1u << warp_threads) - 1;
+    const int lane = thread_idx % 32;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+      const bool has_partner = lane + offset < warp_threads;
+      const float other = tl::shfl_down_sync(mask, value, has_partner ? offset : 0);
+      if (has_partner) value += other;
+    }
+    return tl::shfl_sync(mask, value, 0);
+  }
+  value += tl::shfl_xor_sync(0xffffffff, value, 16);
+  value += tl::shfl_xor_sync(0xffffffff, value, 8);
+  value += tl::shfl_xor_sync(0xffffffff, value, 4);
+  value += tl::shfl_xor_sync(0xffffffff, value, 2);
+  value += tl::shfl_xor_sync(0xffffffff, value, 1);
+  return value;
+}
+#endif
+
 __global__ void JOIN(repeated_reduction_, PROBE_VARIANT)(
     const float *input, float *output, int iterations) {
   const int rank = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
@@ -21,7 +46,11 @@ __global__ void JOIN(repeated_reduction_, PROBE_VARIANT)(
   const float increment = (rank % 2 + 1) * 0.015625f;
 #pragma unroll 1
   for (int iteration = 0; iteration < iterations; ++iteration) {
+#ifdef PROBE_DIRECT_GEOMETRY
+    value = direct_geometry_sum(value);
+#else
     value = tl::warp_reduce_sum(value);
+#endif
     value = value * 0.03125f + increment;
   }
   output[index] = value;
@@ -36,12 +65,13 @@ using Launch = void (*)(const float *, float *, dim3, int, int);
 extern "C" void launch_baseline(const float *, float *, dim3, int, int);
 extern "C" void launch_geometry(const float *, float *, dim3, int, int);
 extern "C" void launch_ballot(const float *, float *, dim3, int, int);
+extern "C" void launch_direct(const float *, float *, dim3, int, int);
 
 int main() {
   constexpr int blocks = 128;
   constexpr int trials = 21;
-  const Launch launches[] = {launch_baseline, launch_geometry, launch_ballot};
-  const char *names[] = {"baseline", "geometry", "ballot"};
+  const Launch launches[] = {launch_baseline, launch_geometry, launch_ballot, launch_direct};
+  const char *names[] = {"baseline", "geometry", "ballot", "direct"};
   const std::vector<dim3> shapes = {dim3(32), dim3(64), dim3(128), dim3(256),
       dim3(1024), dim3(8, 8), dim3(4, 8, 2), dim3(7), dim3(24), dim3(48),
       dim3(7, 7), dim3(3, 3, 5)};
@@ -57,24 +87,24 @@ int main() {
     const int threads = shape.x * shape.y * shape.z;
     const size_t count = blocks * threads;
     const int first_variant = threads % 32 == 0 ? 0 : 1;
-    const int versions = 3 - first_variant;
+    const int versions = 4 - first_variant;
     std::vector<float> host_input(count);
     for (size_t index = 0; index < count; ++index) {
       const int rank = index % threads;
       host_input[index] = (rank % 7 + 1) * 0.125f + (rank / 32 % 3) * 0.0625f;
     }
-    float *input, *outputs[3];
+    float *input, *outputs[4];
     CUDA_CHECK(cudaMalloc(&input, count * sizeof(float)));
     CUDA_CHECK(cudaMemcpy(input, host_input.data(), count * sizeof(float), cudaMemcpyHostToDevice));
-    for (int variant = first_variant; variant < 3; ++variant)
+    for (int variant = first_variant; variant < 4; ++variant)
       CUDA_CHECK(cudaMalloc(&outputs[variant], count * sizeof(float)));
     for (const int iterations : {1, 1024}) {
       for (int warm = 0; warm < 10; ++warm)
-        for (int variant = first_variant; variant < 3; ++variant)
+        for (int variant = first_variant; variant < 4; ++variant)
           launches[variant](input, outputs[variant], shape, blocks, iterations);
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaDeviceSynchronize());
-      std::vector<float> times[3];
+      std::vector<float> times[4];
       for (int trial = 0; trial < trials; ++trial) {
         for (int position = 0; position < versions; ++position) {
           const int variant = first_variant + (trial + position) % versions;
@@ -111,14 +141,14 @@ int main() {
           }
         }
       }
-      for (int variant = first_variant + 1; variant < 3; ++variant) {
+      for (int variant = first_variant + 1; variant < 4; ++variant) {
         CUDA_CHECK(cudaMemcpy(observed.data(), outputs[variant], count * sizeof(float), cudaMemcpyDeviceToHost));
         if (observed != reference) {
           std::fprintf(stderr, "OUTPUT_MISMATCH: %s\n", names[variant]);
           return 1;
         }
       }
-      for (int variant = first_variant; variant < 3; ++variant) {
+      for (int variant = first_variant; variant < 4; ++variant) {
         std::sort(times[variant].begin(), times[variant].end());
         std::printf("summary,%ux%ux%u,%d,%s,min=%.6f,q1=%.6f,median=%.6f,q3=%.6f,max=%.6f\n",
                     shape.x, shape.y, shape.z, iterations, names[variant],
@@ -128,7 +158,7 @@ int main() {
       }
     }
     CUDA_CHECK(cudaFree(input));
-    for (int variant = first_variant; variant < 3; ++variant) CUDA_CHECK(cudaFree(outputs[variant]));
+    for (int variant = first_variant; variant < 4; ++variant) CUDA_CHECK(cudaFree(outputs[variant]));
   }
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));

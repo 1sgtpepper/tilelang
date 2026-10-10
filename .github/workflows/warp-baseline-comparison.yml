@@ -63,14 +63,16 @@ jobs:
           cuda_root=$(dirname "$(dirname "$cuda_nvcc")")
           args=(-std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 -I "$cuda_root/include/cccl" -I source/3rdparty/cutlass/include)
           fixture=validation/validation/warp-baseline-comparison.cu
-          for variant in baseline geometry ballot; do
+          for variant in baseline geometry ballot direct; do
             tree=$variant
+            extra=()
             if [[ "$variant" == ballot ]]; then tree=source; fi
-            "$cuda_nvcc" "${args[@]}" -I "$tree/src" -DPROBE_VARIANT="$variant" -Xptxas=-v -c "$fixture" -o "$variant.o" 2>&1 | tee "baseline-results/$variant-compile.log"
-            "$cuda_nvcc" "${args[@]}" -I "$tree/src" -DPROBE_VARIANT="$variant" --ptx "$fixture" -o "baseline-results/$variant.ptx"
+            if [[ "$variant" == direct ]]; then tree=source; extra=(-DPROBE_DIRECT_GEOMETRY); fi
+            "$cuda_nvcc" "${args[@]}" -I "$tree/src" -DPROBE_VARIANT="$variant" "${extra[@]}" -Xptxas=-v -c "$fixture" -o "$variant.o" 2>&1 | tee "baseline-results/$variant-compile.log"
+            "$cuda_nvcc" "${args[@]}" -I "$tree/src" -DPROBE_VARIANT="$variant" "${extra[@]}" --ptx "$fixture" -o "baseline-results/$variant.ptx"
           done
           "$cuda_nvcc" "${args[@]}" -I source/src -DPROBE_DRIVER -c "$fixture" -o driver.o
-          "$cuda_nvcc" "${args[@]}" driver.o baseline.o geometry.o ballot.o -o baseline-comparison
+          "$cuda_nvcc" "${args[@]}" driver.o baseline.o geometry.o ballot.o direct.o -o baseline-comparison
       - name: Check outputs and measure bounded dependent calls
         run: |
           set -euo pipefail
