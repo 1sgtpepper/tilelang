@@ -107,7 +107,7 @@ int main() {
     for (size_t index = 0; index < count; ++index) {
       const int rank = index % threads;
       host_input[index] =
-          ProbeType((rank % 7 + 1) * 0.125f + (rank / 32 % 3) * 0.0625f);
+          ProbeType((rank % 7 + 1) * 0.125f + (rank / 32 % 3) * 0.125f);
     }
     ProbeType *input, *outputs[3];
     CUDA_CHECK(cudaMalloc(&input, count * sizeof(ProbeType)));
