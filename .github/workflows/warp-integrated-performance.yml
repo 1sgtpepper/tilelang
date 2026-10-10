@@ -58,10 +58,15 @@ jobs:
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$WHEEL_RUN" =~ ^[0-9]+$ ]]
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(cat "$RUNNER_TEMP/integrated-wheelhouse/source-sha.txt")" = "$SOURCE_SHA"
+          wheel_source=$(cat "$RUNNER_TEMP/integrated-wheelhouse/source-sha.txt")
+          [[ "$wheel_source" =~ ^[0-9a-f]{40}$ ]]
+          git -C source diff --exit-code "$wheel_source" "$SOURCE_SHA" -- . \
+            ':(exclude)testing/python/language/test_tilelang_language_warp_reduce.py'
+          echo "WHEEL_SOURCE=$wheel_source" >> "$GITHUB_ENV"
           gh run view "$WHEEL_RUN" --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion | grep -Fx success
           (cd "$RUNNER_TEMP/integrated-wheelhouse" && sha256sum -c wheel.sha256)
-          sha256sum -c "$RUNNER_TEMP/integrated-wheelhouse/source-files.sha256"
+          grep -v 'source/testing/python/language/test_tilelang_language_warp_reduce.py$' \
+            "$RUNNER_TEMP/integrated-wheelhouse/source-files.sha256" | sha256sum -c
           echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
           echo "UV_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/uv" >> "$GITHUB_ENV"
           echo "PIP_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/pip" >> "$GITHUB_ENV"
@@ -89,6 +94,22 @@ jobs:
             validation/validation/warp-softmax-comparison.py > "$output/fixtures.sha256"
           nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv,noheader > "$output/gpu.txt"
           nvcc --version > "$output/nvcc.txt"
+      - name: Execute final-head reducer and NVRTC tests with identical compiled inputs
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          unset TL_TEMPLATE_PATH PYTHONPATH
+          cp "$GITHUB_WORKSPACE/source/testing/python/language/test_tilelang_language_warp_reduce.py" "$RUNNER_TEMP/integrated-reduction-tests.py"
+          cp "$GITHUB_WORKSPACE/source/testing/python/jit/test_tilelang_jit_nvrtc_std.py" "$RUNNER_TEMP/integrated-nvrtc-tests.py"
+          "$RUNNER_TEMP/integrated-venv/bin/python" -m pytest -q \
+            "$RUNNER_TEMP/integrated-reduction-tests.py" "$RUNNER_TEMP/integrated-nvrtc-tests.py" \
+            --junitxml="$INTEGRATED_OUTPUT/tests.xml" 2>&1 | tee "$INTEGRATED_OUTPUT/tests.log"
+          "$RUNNER_TEMP/integrated-venv/bin/python" - "$INTEGRATED_OUTPUT/tests.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
+          assert len(cases) == 293, len(cases)
+          assert not any(case.find(kind) is not None for case in cases for kind in ("failure", "error", "skipped"))
+          PY
       - name: Verify installed package and generated 84-case PTX matrix
         working-directory: ${{ runner.temp }}
         run: |
@@ -133,7 +154,7 @@ jobs:
               --baseline-template "$RUNNER_TEMP/integrated-baseline" \
               --candidate-template "$RUNNER_TEMP/integrated-candidate" \
               --baseline-header-sha "$baseline_sha" --candidate-header-sha "$candidate_sha" \
-              --source-sha "$SOURCE_SHA" --wheel-source-sha "$SOURCE_SHA" \
+              --source-sha "$SOURCE_SHA" --wheel-source-sha "$WHEEL_SOURCE" \
               --wheel-path "$wheel" --wheel-sha "$wheel_sha" \
               --output-dir "$INTEGRATED_OUTPUT/$workload" \
               2>&1 | tee "$INTEGRATED_OUTPUT/$workload.log"
