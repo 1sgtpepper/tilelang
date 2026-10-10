@@ -12,8 +12,6 @@ jobs:
   comparison:
     runs-on: [self-hosted, linux, x64, warp-validation]
     timeout-minutes: 10
-    env:
-      PROBE_RESULTS: ${{ runner.temp }}/warp-gated-${{ github.run_id }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -34,6 +32,8 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
+          PROBE_RESULTS="$RUNNER_TEMP/warp-gated-$GITHUB_RUN_ID"
+          echo "PROBE_RESULTS=$PROBE_RESULTS" >> "$GITHUB_ENV"
           mkdir -p "$PROBE_RESULTS"
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
@@ -78,4 +78,4 @@ jobs:
         if: always()
         with:
           name: warp-gated-comparison
-          path: ${{ env.PROBE_RESULTS }}/
+          path: ${{ runner.temp }}/warp-gated-${{ github.run_id }}/
