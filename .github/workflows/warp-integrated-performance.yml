@@ -63,7 +63,8 @@ jobs:
           git -C source diff --exit-code "$wheel_source" "$SOURCE_SHA" -- . \
             ':(exclude)testing/python/language/test_tilelang_language_warp_reduce.py'
           echo "WHEEL_SOURCE=$wheel_source" >> "$GITHUB_ENV"
-          gh run view "$WHEEL_RUN" --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion | grep -Fx success
+          test "$(gh run view "$WHEEL_RUN" --repo "$GITHUB_REPOSITORY" --json jobs \
+            --jq '.jobs[] | select(.name == "Build exact-source CUDA wheel") | .conclusion')" = success
           (cd "$RUNNER_TEMP/integrated-wheelhouse" && sha256sum -c wheel.sha256)
           grep -v 'source/testing/python/language/test_tilelang_language_warp_reduce.py$' \
             "$RUNNER_TEMP/integrated-wheelhouse/source-files.sha256" | sha256sum -c
@@ -89,6 +90,7 @@ jobs:
             > "$RUNNER_TEMP/integrated-ballot/tl_templates/cuda/reduce.h"
           cp "$RUNNER_TEMP/integrated-wheelhouse/source-sha.txt" "$output/"
           cp "$RUNNER_TEMP/integrated-wheelhouse/wheel.sha256" "$output/"
+          gh run view "$WHEEL_RUN" --repo "$GITHUB_REPOSITORY" --json conclusion,jobs > "$output/wheel-build-run.json"
           git -C validation rev-parse HEAD > "$output/validation-commit.txt"
           sha256sum validation/validation/warp-generated-extent-check.py \
             validation/validation/warp-softmax-comparison.py > "$output/fixtures.sha256"
