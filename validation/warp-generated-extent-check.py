@@ -39,10 +39,18 @@ def kernel(dtype, shape):
 
 def body(ptx):
     assert len(re.findall(r"\.visible\s+\.entry\s", ptx)) == 1
-    match = re.search(r"\.visible\s+\.entry\s+[^\s(]+\s*\([^)]*\)\s*[^\{]*\{(.*)\}\s*$", ptx, re.S)
+    match = re.search(r"\.visible\s+\.entry\s+[^\s(]+\s*\([^)]*\)\s*[^\{]*\{", ptx)
     if match is None:
         raise ValueError("expected exactly one generated PTX kernel")
-    text = re.sub(r"//[^\n]*", "", match.group(1))
+    # NVCC appends debug sections with their own braces after the kernel.
+    depth = 1
+    for end in range(match.end(), len(ptx)):
+        depth += (ptx[end] == "{") - (ptx[end] == "}")
+        if depth == 0:
+            break
+    else:
+        raise ValueError("unclosed generated PTX kernel")
+    text = re.sub(r"//[^\n]*", "", ptx[match.end() : end])
     text = re.sub(r"(?m)^\s*\.loc[^\n]*", "", text)
     return " ".join(text.split())
 
