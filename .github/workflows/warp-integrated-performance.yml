@@ -148,9 +148,13 @@ jobs:
           baseline_sha=$(sha256sum "$RUNNER_TEMP/integrated-baseline/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
           candidate_sha=$(sha256sum "$RUNNER_TEMP/integrated-candidate/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
           for workload in softmax engram; do
+            consumer_args=()
+            if [[ "$workload" == engram ]]; then
+              consumer_args=(--consumer-root "$GITHUB_WORKSPACE/consumer")
+            fi
             "$RUNNER_TEMP/integrated-venv/bin/python" \
               "$GITHUB_WORKSPACE/validation/validation/warp-softmax-comparison.py" \
-              --workload "$workload" --consumer-root "$GITHUB_WORKSPACE/consumer" \
+              --workload "$workload" "${consumer_args[@]}" \
               --baseline-template "$RUNNER_TEMP/integrated-baseline" \
               --candidate-template "$RUNNER_TEMP/integrated-candidate" \
               --baseline-header-sha "$baseline_sha" --candidate-header-sha "$candidate_sha" \
