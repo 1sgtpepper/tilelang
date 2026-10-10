@@ -694,6 +694,8 @@ jobs:
 
           expected_files=$(printf '%s\n' \
             docs/programming_guides/instructions.md \
+            src/cuda/codegen/codegen_cuda.cc \
+            src/cuda/codegen/codegen_cuda.h \
             src/tl_templates/cuda/reduce.h \
             testing/python/language/test_tilelang_language_warp_reduce.py)
           actual_files=$(git -C source diff --name-only "$BASELINE_SHA" "$SOURCE_SHA" | LC_ALL=C sort)
@@ -997,7 +999,7 @@ jobs:
           print(f"gpu={torch.cuda.get_device_name(0)} capability={torch.cuda.get_device_capability(0)}")
           PY
 
-      - name: Run 185 reducer and 14 NVRTC cases with the installed default template
+      - name: Run 243 reducer/codegen and 14 NVRTC cases with the installed default template
         working-directory: ${{ runner.temp }}
         env:
           TILELANG_CACHE_DIR: ${{ runner.temp }}/tilelang-native-wheel-cache
@@ -1016,7 +1018,7 @@ jobs:
           import xml.etree.ElementTree as ET
 
           cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
-          assert len(cases) == 185, f"expected 185 regression/control cases; got {len(cases)}"
+          assert len(cases) == 243, f"expected 243 regression/codegen cases; got {len(cases)}"
           failures = [case.get("name") for case in cases if case.find("failure") is not None]
           errors = [case.get("name") for case in cases if case.find("error") is not None]
           skipped = [case.get("name") for case in cases if case.find("skipped") is not None]
