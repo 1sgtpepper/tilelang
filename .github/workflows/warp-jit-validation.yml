@@ -605,6 +605,8 @@ jobs:
             | tee "$RUNNER_TEMP/tilelang-wheel-build.log"
           cmake_cache="$GITHUB_WORKSPACE/source/build/CMakeCache.txt"
           test -f "$cmake_cache"
+          grep -E '^(CMAKE_CUDA_COMPILER|CUDAToolkit_ROOT|TILELANG_CUDA_TOOLKIT_SOURCE|USE_CUDA):' \
+            "$cmake_cache" | tee "$RUNNER_TEMP/tilelang-cuda-cache.txt"
           grep -Fxq "CMAKE_CUDA_COMPILER:FILEPATH=$nvcc_path" "$cmake_cache"
           grep -Fxq "CUDAToolkit_ROOT:PATH=${nvcc_path%/bin/nvcc}" "$cmake_cache"
           grep -Fxq "TILELANG_CUDA_TOOLKIT_SOURCE:INTERNAL=pip" "$cmake_cache"
@@ -642,6 +644,7 @@ jobs:
           cp "$wheel" "$RUNNER_TEMP/tilelang-wheel-artifact/"
           cp "$RUNNER_TEMP/tilelang-wheel-build.log" "$RUNNER_TEMP/tilelang-wheel-artifact/"
           cp "$RUNNER_TEMP/build-python-packages.txt" "$RUNNER_TEMP/tilelang-wheel-artifact/"
+          cp "$RUNNER_TEMP/tilelang-cuda-cache.txt" "$RUNNER_TEMP/tilelang-wheel-artifact/"
           printf '%s\n' "$SOURCE_SHA" > "$RUNNER_TEMP/tilelang-wheel-artifact/source-sha.txt"
           (cd "$RUNNER_TEMP/tilelang-wheel-artifact" && \
             sha256sum "$(basename "$wheel")" > wheel.sha256)
