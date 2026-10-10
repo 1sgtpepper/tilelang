@@ -25,8 +25,6 @@ jobs:
       PYTHONPATH: ""
       UV_HTTP_TIMEOUT: "300"
       UV_CONCURRENT_DOWNLOADS: "3"
-      UV_CACHE_DIR: ${{ runner.tool_cache }}/.warp-cache/uv
-      PIP_CACHE_DIR: ${{ runner.tool_cache }}/.warp-cache/pip
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -71,6 +69,8 @@ jobs:
           grep -v 'source/testing/python/language/test_tilelang_language_warp_reduce.py$' \
             "$RUNNER_TEMP/integrated-wheelhouse/source-files.sha256" | sha256sum -c
           echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
+          export UV_CACHE_DIR="$RUNNER_TOOL_CACHE/.warp-cache/uv"
+          export PIP_CACHE_DIR="$RUNNER_TOOL_CACHE/.warp-cache/pip"
           uv venv --python 3.12 "$RUNNER_TEMP/integrated-venv"
           mapfile -t wheels < <(find "$RUNNER_TEMP/integrated-wheelhouse" -maxdepth 1 -name 'tilelang-*.whl' -print)
           test "${#wheels[@]}" -eq 1
