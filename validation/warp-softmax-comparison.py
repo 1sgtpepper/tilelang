@@ -213,6 +213,7 @@ def worker(config: dict) -> int:
         "captured_kernel_nodes": node_count,
         "graph_replay_regenerated_nan_filled_output": True,
         "warmup_graph_replays": WARMUPS,
+        "untimed_graph_replays_immediately_before_each_sample": 1,
         "cache_policy": "repeated graph over reused input/output buffers; no flush or cache-residency claim",
         "max_abs_error_vs_torch_softmax": (y - reference).abs().max().item(),
         "output_path": str(Path(config["output_dir"]) / f"{variant}-output.f32"),
@@ -230,10 +231,12 @@ def worker(config: dict) -> int:
             stream.synchronize()
             protocol({"kind": "WARMED", "variant": variant})
         elif command == "RUN":
-            start.record(stream)
             with torch.cuda.stream(stream):
+                # Warm this worker's graph after the process handoff, before timing.
                 graph.replay()
-            end.record(stream)
+                start.record(stream)
+                graph.replay()
+                end.record(stream)
             end.synchronize()
             elapsed_ms = start.elapsed_time(end) / GRAPH_LAUNCHES
             if not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
@@ -482,9 +485,10 @@ def controller(args: argparse.Namespace) -> int:
                 "threads_per_cta": THREADS,
                 "graph_launches_per_sample": GRAPH_LAUNCHES,
                 "warmup_graph_replays_per_variant": WARMUPS,
+                "untimed_graph_replays_immediately_before_each_sample": 1,
                 "paired_samples": PAIRS,
                 "cache_mode": "repeated graph over reused input/output buffers; no flush or cache-residency claim",
-                "timing": "CUDA-event duration of one graph replay divided by 128 whole kernel launches",
+                "timing": "one immediate untimed replay, then CUDA-event duration of one replay divided by 128 whole kernel launches",
                 "times_ms_per_kernel": times,
                 "provenance": provenance,
                 "variants": done,
