@@ -122,12 +122,12 @@ jobs:
           fixture=validation/validation/warp-reduce-check.cu
           for variant in baseline ballot redux; do
             case "$variant" in
-              baseline) include_root=baseline/src; include_tail=() ;;
-              ballot) include_root=source/src; include_tail=() ;;
-              redux) include_root="$PROBE_RESULTS/redux/src"; include_tail=() ;;
+              baseline) include_root=baseline/src ;;
+              ballot) include_root=source/src ;;
+              redux) include_root="$PROBE_RESULTS/redux/src" ;;
             esac
             "$cuda_nvcc" -std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 \
-              -I "$cuda_root/include/cccl" -I "$include_root" "${include_tail[@]}" \
+              -I "$cuda_root/include/cccl" -I "$include_root" \
               -I source/3rdparty/cutlass/include "$fixture" \
               -o "$PROBE_RESULTS/oracle-$variant"
             status=0
@@ -153,14 +153,14 @@ jobs:
           for target in sm_75 sm_120 sm_100a sm_100f; do
             for variant in base candidate redux; do
               case "$variant" in
-                base) include_root=baseline/src; include_tail=() ;;
-                candidate) include_root=source/src; include_tail=() ;;
-                redux) include_root="$PROBE_RESULTS/redux/src"; include_tail=() ;;
+                base) include_root=baseline/src ;;
+                candidate) include_root=source/src ;;
+                redux) include_root="$PROBE_RESULTS/redux/src" ;;
               esac
               output="$PROBE_RESULTS/codegen/$variant-$target.ptx"
               "$cuda_nvcc" --ptx -std=c++17 -O3 "-arch=$target" \
                 -ccbin /usr/bin/g++-15 -I "$cuda_root/include/cccl" \
-                -I "$include_root" "${include_tail[@]}" \
+                -I "$include_root" \
                 -I source/3rdparty/cutlass/include "$fixture" -o "$output" \
                 2>&1 | tee "$PROBE_RESULTS/codegen/$variant-$target.compile.log"
             done
@@ -206,6 +206,7 @@ jobs:
                       if checker.normalize(body("candidate", target, kernel)) != \
                               checker.normalize(body("redux", target, kernel)):
                           raise SystemExit(f"{target}: pre-SM80 fallback differs for {kernel}")
+                  continue
               kernels = [("warp_codegen_f32_sum", 1), ("warp_codegen_f64_sum", 2)]
               if target != "sm_100a":
                   kernels.extend((f"warp_codegen_f32_{op}", 1) for op in ("min", "max"))
@@ -255,15 +256,15 @@ jobs:
           fixture=validation/validation/warp-gated-comparison.cu
           for variant in baseline ballot redux; do
             case "$variant" in
-              baseline) include_root=baseline/src; include_tail=() ;;
-              ballot) include_root=source/src; include_tail=() ;;
-              redux) include_root="$PROBE_RESULTS/redux/src"; include_tail=() ;;
+              baseline) include_root=baseline/src ;;
+              ballot) include_root=source/src ;;
+              redux) include_root="$PROBE_RESULTS/redux/src" ;;
             esac
-            "$cuda_nvcc" "${args[@]}" -I "$include_root" "${include_tail[@]}" \
+            "$cuda_nvcc" "${args[@]}" -I "$include_root" \
               -DPROBE_VARIANT="$variant" -Xptxas=-v -c "$fixture" \
               -o "$PROBE_RESULTS/$variant.o" \
               2>&1 | tee "$PROBE_RESULTS/$variant-ptxas.txt"
-            "$cuda_nvcc" "${args[@]}" -I "$include_root" "${include_tail[@]}" \
+            "$cuda_nvcc" "${args[@]}" -I "$include_root" \
               -DPROBE_VARIANT="$variant" --ptx "$fixture" \
               -o "$PROBE_RESULTS/$variant-sm_120.ptx"
           done
