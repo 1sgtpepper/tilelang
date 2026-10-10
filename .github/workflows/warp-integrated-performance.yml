@@ -174,6 +174,7 @@ jobs:
               print(name, "median_percent", median, "upper_95_percent", upper)
               assert median <= 5 and upper <= 5, (name, median, upper)
               assert not report["environment_flags"], report["environment_flags"]
+              assert report["output_agreement"]["bytes_equal"], name
           PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
