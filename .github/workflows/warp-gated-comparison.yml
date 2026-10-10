@@ -109,6 +109,11 @@ jobs:
           Path(sys.argv[2]).write_text("".join(diff), encoding="utf-8")
           print("prototype header SHA256=" + hashlib.sha256(target.read_bytes()).hexdigest())
           PY
+          # Keep local TileLang headers beside reduce.h for its quoted include,
+          # but do not add that directory as an include root: it shadows CUDA's
+          # <cuda_fp8.h> with TileLang's same-named wrapper.
+          cp source/src/tl_templates/cuda/common.h \
+            "$PROBE_RESULTS/redux/src/tl_templates/cuda/common.h"
       - name: Run the 5,480-case direct oracle on baseline, ballot, and redux
         run: |
           set -euo pipefail
@@ -119,10 +124,7 @@ jobs:
             case "$variant" in
               baseline) include_root=baseline/src; include_tail=() ;;
               ballot) include_root=source/src; include_tail=() ;;
-              redux)
-                include_root="$PROBE_RESULTS/redux/src"
-                include_tail=(-I source/src/tl_templates/cuda -I source/src)
-                ;;
+              redux) include_root="$PROBE_RESULTS/redux/src"; include_tail=() ;;
             esac
             "$cuda_nvcc" -std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 \
               -I "$cuda_root/include/cccl" -I "$include_root" "${include_tail[@]}" \
@@ -153,10 +155,7 @@ jobs:
               case "$variant" in
                 base) include_root=baseline/src; include_tail=() ;;
                 candidate) include_root=source/src; include_tail=() ;;
-                redux)
-                  include_root="$PROBE_RESULTS/redux/src"
-                  include_tail=(-I source/src/tl_templates/cuda -I source/src)
-                  ;;
+                redux) include_root="$PROBE_RESULTS/redux/src"; include_tail=() ;;
               esac
               output="$PROBE_RESULTS/codegen/$variant-$target.ptx"
               "$cuda_nvcc" --ptx -std=c++17 -O3 "-arch=$target" \
@@ -258,10 +257,7 @@ jobs:
             case "$variant" in
               baseline) include_root=baseline/src; include_tail=() ;;
               ballot) include_root=source/src; include_tail=() ;;
-              redux)
-                include_root="$PROBE_RESULTS/redux/src"
-                include_tail=(-I source/src/tl_templates/cuda -I source/src)
-                ;;
+              redux) include_root="$PROBE_RESULTS/redux/src"; include_tail=() ;;
             esac
             "$cuda_nvcc" "${args[@]}" -I "$include_root" "${include_tail[@]}" \
               -DPROBE_VARIANT="$variant" -Xptxas=-v -c "$fixture" \
