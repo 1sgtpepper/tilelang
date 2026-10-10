@@ -87,13 +87,17 @@ jobs:
           mkdir -p "$tools"
           sanitizer=cuda_sanitizer_api-linux-x86_64-13.3.27-archive
           cuobjdump=cuda_cuobjdump-linux-x86_64-13.3.29-archive
-          for name in "$sanitizer" "$cuobjdump"; do
+          nvdisasm=cuda_nvdisasm-linux-x86_64-13.3.29-archive
+          for name in "$sanitizer" "$cuobjdump" "$nvdisasm"; do
             if [[ "$name" == "$sanitizer" ]]; then
               component=cuda_sanitizer_api
               digest=bed47e6b465653a8d4138bce412733131536f1a0e8ab306bb2b0a15f92fc68ff
-            else
+            elif [[ "$name" == "$cuobjdump" ]]; then
               component=cuda_cuobjdump
               digest=9ac891072c4f9c2079cff8fdc3939ac97c5c5bcdf7cb5cca5a351354c7a8ff21
+            else
+              component=cuda_nvdisasm
+              digest=95b7f617ea11bb983a7150827a14ff4488cba10f0171fa8ae2e845bd58823456
             fi
             archive="$tools/$name.tar.xz"
             if [[ ! -f "$archive" ]]; then
@@ -107,11 +111,12 @@ jobs:
           "$tools/$sanitizer/compute-sanitizer/compute-sanitizer" --version \
             > tool-results/sanitizer-version.txt
           "$tools/$cuobjdump/bin/cuobjdump" --version > tool-results/cuobjdump-version.txt
+          "$tools/$nvdisasm/bin/nvdisasm" --version > tool-results/nvdisasm-version.txt
           sha256sum warp-reduce-check source/src/tl_templates/cuda/reduce.h \
             validation/validation/warp-reduce-check.cu > tool-results/source-and-binary.sha256
           "$tools/$cuobjdump/bin/cuobjdump" --dump-resource-usage warp-reduce-check \
             > tool-results/resources.txt
-          "$tools/$cuobjdump/bin/cuobjdump" --dump-sass warp-reduce-check \
+          PATH="$tools/$nvdisasm/bin:$PATH" "$tools/$cuobjdump/bin/cuobjdump" --dump-sass warp-reduce-check \
             > tool-results/sass.txt
       - name: Run memory and synchronization checks
         if: ${{ inputs.sanitizer }}
