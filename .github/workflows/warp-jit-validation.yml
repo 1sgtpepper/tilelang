@@ -1,14 +1,20 @@
-# This uses the upstream CUDA wheel only as its unchanged host/runtime package.
-# It copies the exact source templates and regression test out of the checkout,
-# then invokes the public TileLang warp-reduce API in fresh Python processes.
-# The warp-validation runner is an SM120 RTX 5070: f32 min/max use the generic
-# shuffle path there (SM100 redux requires the SM100 feature macros), while
-# int32 also exercises the SM80+ integral redux path.
+# Header mode overlays the exact reducer template on an unchanged upstream wheel.
+# Wheel mode builds the exact source commit and tests its installed default template.
+# Both modes exercise the public warp-reduction API on the SM120 RTX 5070:
+# f32 min/max use the generic shuffle path there, while int32 also exercises redux.
 name: Warp reduction JIT validation
 
 on:
   workflow_dispatch:
     inputs:
+      validation_kind:
+        description: Select header-overlay or exact-source wheel validation
+        required: true
+        type: choice
+        options:
+          - header
+          - wheel
+        default: header
       source_sha:
         description: Exact fork commit containing the helper fix and regression tests
         required: true
@@ -19,11 +25,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: warp-reduction-jit-${{ github.repository }}
+  group: warp-reduction-jit-${{ github.repository }}-${{ inputs.validation_kind }}
   cancel-in-progress: false
 
 jobs:
   cuda:
+    if: ${{ inputs.validation_kind != 'wheel' }}
     runs-on: [self-hosted, linux, x64, warp-validation]
     timeout-minutes: 35
     env:
@@ -389,5 +396,393 @@ jobs:
         with:
           name: warp-reduction-jit-results
           path: jit-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+  build-wheel:
+    if: ${{ inputs.validation_kind == 'wheel' }}
+    name: Build exact-source CUDA wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      USE_CUDA: "ON"
+      USE_ROCM: "OFF"
+      USE_ASCEND: "OFF"
+      USE_METAL: "OFF"
+      USE_LLVM: "OFF"
+    steps:
+      - name: Check out exact source commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source scope and submodule identities
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          BASELINE_SHA=194c1b897aa5269e9a89d44c88efdf578a3df620
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C source cat-file -e "${BASELINE_SHA}^{commit}"
+          git -C source merge-base --is-ancestor "$BASELINE_SHA" "$SOURCE_SHA"
+
+          expected_files=$(printf '%s\n' \
+            docs/programming_guides/instructions.md \
+            src/tl_templates/cuda/reduce.h \
+            testing/python/language/test_tilelang_language_warp_reduce.py)
+          actual_files=$(git -C source diff --name-only "$BASELINE_SHA" "$SOURCE_SHA" | LC_ALL=C sort)
+          if [[ "$actual_files" != "$expected_files" ]]; then
+            printf 'Unexpected files in source patch:\n%s\n' "$actual_files"
+            exit 1
+          fi
+
+          git -C source submodule update --init --recursive --depth 1 --jobs 2
+          submodule_status=$(git -C source submodule status --recursive)
+          printf '%s\n' "$submodule_status"
+          if grep -qE '^[-+U]' <<<"$submodule_status"; then
+            echo "A recursive submodule is missing or does not match its gitlink." >&2
+            exit 1
+          fi
+          for path in 3rdparty/tvm 3rdparty/cutlass; do
+            expected=$(git -C source rev-parse "$SOURCE_SHA:$path")
+            actual=$(git -C "source/$path" rev-parse HEAD)
+            test "$actual" = "$expected"
+          done
+
+          printf 'SOURCE_SHA=%s\nBASELINE_SHA=%s\n' "$SOURCE_SHA" "$BASELINE_SHA"
+          (cd source && sha256sum \
+            src/tl_templates/cuda/reduce.h \
+            testing/python/language/test_tilelang_language_warp_reduce.py \
+            testing/python/jit/test_tilelang_jit_nvrtc_std.py)
+
+      - name: Cache Python build downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/.cache/pip
+          key: tile-wheel-pip-ubuntu24-py312-${{ hashFiles('source/pyproject.toml') }}
+          restore-keys: |
+            tile-wheel-pip-ubuntu24-py312-
+
+      - name: Cache C++ compilation
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
+        with:
+          max-size: "2GB"
+          create-symlink: true
+          evict-old-files: "7d"
+          append-timestamp: false
+          key: tile-wheel-ubuntu24-py312-cuda130-${{ inputs.source_sha }}
+          restore-keys: |
+            tile-wheel-ubuntu24-py312-cuda130-
+
+      - name: Set up Python 3.12
+        run: |
+          set -euo pipefail
+          build_venv="$RUNNER_TEMP/tilelang-build-venv"
+          python3.12 -m venv "$build_venv"
+          echo "VIRTUAL_ENV=$build_venv" >> "$GITHUB_ENV"
+          echo "$build_venv/bin" >> "$GITHUB_PATH"
+          "$build_venv/bin/python" --version
+
+      - name: Install pinned build and CUDA toolchains
+        run: |
+          set -euo pipefail
+          build_python="$RUNNER_TEMP/tilelang-build-venv/bin/python"
+          "$build_python" -m pip install --disable-pip-version-check --upgrade pip
+          "$build_python" -m pip install --disable-pip-version-check \
+            build \
+            'cython>=3.1.0' \
+            scikit-build-core \
+            'cmake>=3.26.1' \
+            'z3-solver>=4.13.0,<4.15.5' \
+            'patchelf>=0.17.2'
+
+          cat > "$RUNNER_TEMP/cuda-toolchain-requirements.txt" <<'EOF'
+          nvidia-cuda-nvcc==13.0.88 --hash=sha256:56fe502eb77625a12f25172caa3cdddb4e4c8ba2c8c17dba44b164761b380f03
+          nvidia-cuda-cccl==13.0.85 --hash=sha256:e0da7ad981f3a8aff08241b5bfc1af868742a63e2762f53a5171c492ef242649
+          nvidia-cuda-runtime==13.0.96 --hash=sha256:7f82250d7782aa23b6cfe765ecc7db554bd3c2870c43f3d1821f1d18aebf0548
+          nvidia-cuda-nvrtc==13.0.88 --hash=sha256:ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575
+          nvidia-nvvm==13.0.88 --hash=sha256:c5f41ffeb6466944a026dfa5317d7d85355c119bbec279205d22f1869d1054e0
+          nvidia-cuda-crt==13.0.88 --hash=sha256:2c8043c7c9e02492716426e9919fc78d2c5b3b2a7a768a88e952676b08aa55a4
+          EOF
+          "$build_python" -m pip install --disable-pip-version-check \
+            --require-hashes -r "$RUNNER_TEMP/cuda-toolchain-requirements.txt"
+
+          find "$RUNNER_TEMP/tilelang-build-venv/lib" \
+            -path '*/nvidia/cu13/bin/nvcc' -type f -print -quit \
+            | tee "$RUNNER_TEMP/pip-nvcc-path.txt"
+          nvcc_path=$(cat "$RUNNER_TEMP/pip-nvcc-path.txt")
+          test -n "$nvcc_path"
+          "$nvcc_path" --version | tee "$RUNNER_TEMP/pip-nvcc-version.txt"
+          "$build_python" -m pip list --format=freeze \
+            | tee "$RUNNER_TEMP/build-python-packages.txt"
+
+      - name: Build one CUDA-only native wheel
+        working-directory: source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          WITH_PIP_CUDA_TOOLCHAIN: ${{ runner.temp }}/tilelang-build-venv
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dist" "$RUNNER_TEMP/tilelang-wheel-artifact"
+          build_python="$RUNNER_TEMP/tilelang-build-venv/bin/python"
+          nvcc_path=$(cat "$RUNNER_TEMP/pip-nvcc-path.txt")
+          nvrtc_header="${nvcc_path%/bin/nvcc}/include/nvrtc.h"
+          test -f "$nvrtc_header"
+          "$build_python" -m build --verbose --wheel --no-isolation \
+            --outdir "$RUNNER_TEMP/dist" 2>&1 \
+            | tee "$RUNNER_TEMP/tilelang-wheel-build.log"
+          cmake_cache="$GITHUB_WORKSPACE/source/build/CMakeCache.txt"
+          test -f "$cmake_cache"
+          grep -Fxq "CMAKE_CUDA_COMPILER:FILEPATH=$nvcc_path" "$cmake_cache"
+          grep -Fxq "CUDAToolkit_ROOT:PATH=${nvcc_path%/bin/nvcc}" "$cmake_cache"
+          grep -Fxq "TILELANG_CUDA_TOOLKIT_SOURCE:INTERNAL=pip" "$cmake_cache"
+          grep -Fxq "USE_CUDA:STRING=ON" "$cmake_cache"
+
+          mapfile -t wheels < <(find "$RUNNER_TEMP/dist" -maxdepth 1 \
+            -type f -name 'tilelang-*.whl' -print | sort)
+          test "${#wheels[@]}" -eq 1
+          wheel="${wheels[0]}"
+          case "$(basename "$wheel")" in
+            tilelang-*-cp39-abi3-linux_x86_64.whl) ;;
+            *) echo "Unexpected native wheel filename: $wheel" >&2; exit 1 ;;
+          esac
+          if [[ "$wheel" == *manylinux* ]]; then
+            echo "This validation builds a native Linux wheel, not manylinux." >&2
+            exit 1
+          fi
+
+          "$build_python" - "$wheel" src/tl_templates/cuda/reduce.h <<'PY'
+          import hashlib
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          wheel, source_header = map(Path, sys.argv[1:])
+          expected = hashlib.sha256(source_header.read_bytes()).hexdigest()
+          with zipfile.ZipFile(wheel) as archive:
+              member = "tilelang/src/tl_templates/cuda/reduce.h"
+              assert member in archive.namelist(), f"wheel omitted {member}"
+              actual = hashlib.sha256(archive.read(member)).hexdigest()
+          assert actual == expected, f"wheel header hash mismatch: {actual} != {expected}"
+          print(f"wheel_header_sha256={actual}")
+          PY
+
+          cp "$wheel" "$RUNNER_TEMP/tilelang-wheel-artifact/"
+          cp "$RUNNER_TEMP/tilelang-wheel-build.log" "$RUNNER_TEMP/tilelang-wheel-artifact/"
+          cp "$RUNNER_TEMP/build-python-packages.txt" "$RUNNER_TEMP/tilelang-wheel-artifact/"
+          printf '%s\n' "$SOURCE_SHA" > "$RUNNER_TEMP/tilelang-wheel-artifact/source-sha.txt"
+          (cd "$RUNNER_TEMP/tilelang-wheel-artifact" && \
+            sha256sum "$(basename "$wheel")" > wheel.sha256)
+          (cd "$GITHUB_WORKSPACE" && sha256sum \
+            source/src/tl_templates/cuda/reduce.h \
+            source/testing/python/language/test_tilelang_language_warp_reduce.py \
+            source/testing/python/jit/test_tilelang_jit_nvrtc_std.py) \
+            > "$RUNNER_TEMP/tilelang-wheel-artifact/source-files.sha256"
+          git submodule status --recursive \
+            > "$RUNNER_TEMP/tilelang-wheel-artifact/submodules.txt"
+
+      - name: Upload exact-source native wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: tilelang-native-wheel
+          path: ${{ runner.temp }}/tilelang-wheel-artifact/
+          if-no-files-found: error
+          retention-days: 3
+
+  wheel-gpu:
+    if: ${{ inputs.validation_kind == 'wheel' }}
+    needs: build-wheel
+    name: Test installed wheel on CUDA
+    runs-on: [self-hosted, linux, x64, warp-validation]
+    timeout-minutes: 35
+    env:
+      CUDA_HOME: /home/sgtpepper/.local/cuda-13.3
+      NVCC_CCBIN: /usr/bin/g++-15
+      CXX: /usr/bin/g++-15
+      TILELANG_DISABLE_CACHE: "1"
+      UV_HTTP_TIMEOUT: "300"
+      UV_CONCURRENT_DOWNLOADS: "3"
+      PYTHONPATH: ""
+    steps:
+      - name: Check out exact source commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download exact-source wheel and hashes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: tilelang-native-wheel
+          path: ${{ runner.temp }}/tilelang-wheelhouse
+
+      - name: Reuse Python 3.12 and dependency caches
+        run: |
+          set -euo pipefail
+          command -v uv
+          uv --version
+          uv python find 3.12
+          /usr/bin/g++-15 --version
+          echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
+          echo "UV_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/uv" >> "$GITHUB_ENV"
+          echo "PIP_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/pip" >> "$GITHUB_ENV"
+
+      - name: Verify source, wheel, and installed template identity
+        working-directory: ${{ runner.temp }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TILELANG_CACHE_DIR: ${{ runner.temp }}/tilelang-native-wheel-cache
+        run: |
+          set -euo pipefail
+          unset TL_TEMPLATE_PATH PYTHONPATH
+          mkdir -p "$GITHUB_WORKSPACE/wheel-results"
+          BASELINE_SHA=194c1b897aa5269e9a89d44c88efdf578a3df620
+          test "$(git -C "$GITHUB_WORKSPACE/source" rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C "$GITHUB_WORKSPACE/source" merge-base --is-ancestor \
+            "$BASELINE_SHA" "$SOURCE_SHA"
+
+          (cd "$GITHUB_WORKSPACE" && sha256sum -c \
+            "$RUNNER_TEMP/tilelang-wheelhouse/source-files.sha256")
+          test "$(cat "$RUNNER_TEMP/tilelang-wheelhouse/source-sha.txt")" = "$SOURCE_SHA"
+
+          mapfile -t wheels < <(find "$RUNNER_TEMP/tilelang-wheelhouse" \
+            -maxdepth 1 -type f -name 'tilelang-*.whl' -print | sort)
+          test "${#wheels[@]}" -eq 1
+          wheel="${wheels[0]}"
+          case "$(basename "$wheel")" in
+            tilelang-*-cp39-abi3-linux_x86_64.whl) ;;
+            *) echo "Unexpected native wheel filename: $wheel" >&2; exit 1 ;;
+          esac
+          (cd "$RUNNER_TEMP/tilelang-wheelhouse" && sha256sum -c wheel.sha256) \
+            | tee "$GITHUB_WORKSPACE/wheel-results/wheel.sha256"
+
+          uv venv --python 3.12 "$RUNNER_TEMP/tilelang-wheel-venv"
+          uv pip install --python "$RUNNER_TEMP/tilelang-wheel-venv/bin/python" \
+            'https://download-r2.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=5359b255ac68c0cabb8293952b38e00f0d1a570815cd87f19b61af702c071410'
+          uv pip install --python "$RUNNER_TEMP/tilelang-wheel-venv/bin/python" \
+            "$wheel" 'pytest==9.1.1' 'cuda-bindings==13.4.3'
+
+          cp "$GITHUB_WORKSPACE/source/testing/python/language/test_tilelang_language_warp_reduce.py" \
+            "$RUNNER_TEMP/test_tilelang_language_warp_reduce.py"
+          cp "$GITHUB_WORKSPACE/source/testing/python/jit/test_tilelang_jit_nvrtc_std.py" \
+            "$RUNNER_TEMP/test_tilelang_jit_nvrtc_std.py"
+          cmp "$GITHUB_WORKSPACE/source/testing/python/language/test_tilelang_language_warp_reduce.py" \
+            "$RUNNER_TEMP/test_tilelang_language_warp_reduce.py"
+          cmp "$GITHUB_WORKSPACE/source/testing/python/jit/test_tilelang_jit_nvrtc_std.py" \
+            "$RUNNER_TEMP/test_tilelang_jit_nvrtc_std.py"
+          sha256sum "$RUNNER_TEMP/test_tilelang_language_warp_reduce.py" \
+            "$RUNNER_TEMP/test_tilelang_jit_nvrtc_std.py" \
+            | tee "$GITHUB_WORKSPACE/wheel-results/test-files.sha256"
+
+          nvcc --version | tee "$GITHUB_WORKSPACE/wheel-results/nvcc.txt"
+          nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv,noheader \
+            | tee "$GITHUB_WORKSPACE/wheel-results/gpu.txt"
+          "$RUNNER_TEMP/tilelang-wheel-venv/bin/python" - <<'PY' \
+            | tee "$GITHUB_WORKSPACE/wheel-results/runtime.txt"
+          import hashlib
+          import importlib.metadata as metadata
+          import os
+          import sys
+          from pathlib import Path
+
+          import tilelang
+          import torch
+          from cuda.bindings import nvrtc
+          from tilelang.env import TILELANG_TEMPLATE_PATH
+
+          assert "TL_TEMPLATE_PATH" not in os.environ
+          assert "PYTHONPATH" not in os.environ
+          package_path = Path(tilelang.__file__).resolve()
+          assert package_path.is_relative_to(Path(sys.prefix).resolve()), package_path
+          source_root = Path(os.environ["GITHUB_WORKSPACE"], "source").resolve()
+          assert not package_path.is_relative_to(source_root), package_path
+          template_root = Path(TILELANG_TEMPLATE_PATH).resolve()
+          assert template_root == package_path.parent / "src", template_root
+          packaged_header = template_root / "tl_templates/cuda/reduce.h"
+          source_header = source_root / "src/tl_templates/cuda/reduce.h"
+          packaged_hash = hashlib.sha256(packaged_header.read_bytes()).hexdigest()
+          source_hash = hashlib.sha256(source_header.read_bytes()).hexdigest()
+          assert packaged_hash == source_hash, f"{packaged_hash} != {source_hash}"
+          assert torch.cuda.is_available(), "CUDA is required for this validation"
+          assert torch.cuda.device_count() == 1, "Use the single-GPU warp-validation runner"
+          assert torch.cuda.get_device_capability(0) == (12, 0), "Use the SM120 warp-validation GPU"
+
+          print(f"source_sha={os.environ['SOURCE_SHA']}")
+          print(f"tilelang={metadata.version('tilelang')} path={package_path}")
+          print(f"template_root={template_root}")
+          print(f"candidate_header_sha256={source_hash}")
+          print(f"installed_header_sha256={packaged_hash}")
+          print(f"torch={torch.__version__} cuda={torch.version.cuda} path={Path(torch.__file__).resolve()}")
+          for distribution in ("cuda-bindings", "cuda-python", "pytest"):
+              try:
+                  print(f"{distribution}={metadata.version(distribution)}")
+              except metadata.PackageNotFoundError:
+                  print(f"{distribution}=not-installed")
+          result, major, minor = nvrtc.nvrtcVersion()
+          assert result == nvrtc.nvrtcResult.NVRTC_SUCCESS
+          print(f"nvrtc={major}.{minor}")
+          print(f"gpu={torch.cuda.get_device_name(0)} capability={torch.cuda.get_device_capability(0)}")
+          PY
+
+      - name: Run 185 reducer and 14 NVRTC cases with the installed default template
+        working-directory: ${{ runner.temp }}
+        env:
+          TILELANG_CACHE_DIR: ${{ runner.temp }}/tilelang-native-wheel-cache
+        run: |
+          set -euo pipefail
+          unset TL_TEMPLATE_PATH PYTHONPATH
+          python_bin="$RUNNER_TEMP/tilelang-wheel-venv/bin/python"
+          test_file="$RUNNER_TEMP/test_tilelang_language_warp_reduce.py"
+          nvrtc_test_file="$RUNNER_TEMP/test_tilelang_jit_nvrtc_std.py"
+
+          "$python_bin" -m pytest -q \
+            --junitxml="$GITHUB_WORKSPACE/wheel-results/patched.xml" \
+            "$test_file" 2>&1 | tee "$GITHUB_WORKSPACE/wheel-results/patched.log"
+          "$python_bin" - "$GITHUB_WORKSPACE/wheel-results/patched.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
+          assert len(cases) == 185, f"expected 185 regression/control cases; got {len(cases)}"
+          failures = [case.get("name") for case in cases if case.find("failure") is not None]
+          errors = [case.get("name") for case in cases if case.find("error") is not None]
+          skipped = [case.get("name") for case in cases if case.find("skipped") is not None]
+          assert not failures, f"unexpected failures: {failures}"
+          assert not errors, f"unexpected errors: {errors}"
+          assert not skipped, f"CUDA regressions must not be skipped: {skipped}"
+          print(f"PATCHED_CASES_PASSED={len(cases)}; SKIPPED=0")
+          PY
+
+          "$python_bin" -m pytest -q \
+            --junitxml="$GITHUB_WORKSPACE/wheel-results/nvrtc.xml" \
+            "$nvrtc_test_file" 2>&1 | tee "$GITHUB_WORKSPACE/wheel-results/nvrtc.log"
+          "$python_bin" - "$GITHUB_WORKSPACE/wheel-results/nvrtc.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
+          assert len(cases) == 14, f"expected 14 NVRTC cases; got {len(cases)}"
+          failures = [case.get("name") for case in cases if case.find("failure") is not None]
+          errors = [case.get("name") for case in cases if case.find("error") is not None]
+          skipped = [case.get("name") for case in cases if case.find("skipped") is not None]
+          assert not failures, f"unexpected NVRTC failures: {failures}"
+          assert not errors, f"unexpected NVRTC errors: {errors}"
+          assert not skipped, f"NVRTC cases must not be skipped: {skipped}"
+          print(f"NVRTC_CASES_PASSED={len(cases)}; SKIPPED=0")
+          PY
+
+      - name: Upload installed-wheel validation results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: tilelang-native-wheel-results
+          path: wheel-results/
           if-no-files-found: warn
           retention-days: 7
