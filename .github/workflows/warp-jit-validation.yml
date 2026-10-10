@@ -607,7 +607,7 @@ jobs:
           test -f "$cmake_cache"
           grep -E '^(CMAKE_CUDA_COMPILER|CUDAToolkit_ROOT|TILELANG_CUDA_TOOLKIT_SOURCE|USE_CUDA):' \
             "$cmake_cache" | tee "$RUNNER_TEMP/tilelang-cuda-cache.txt"
-          grep -Fxq "CMAKE_CUDA_COMPILER:FILEPATH=$nvcc_path" "$cmake_cache"
+          grep -Fxq "CMAKE_CUDA_COMPILER:STRING=$nvcc_path" "$cmake_cache"
           grep -Fxq "CUDAToolkit_ROOT:PATH=${nvcc_path%/bin/nvcc}" "$cmake_cache"
           grep -Fxq "TILELANG_CUDA_TOOLKIT_SOURCE:INTERNAL=pip" "$cmake_cache"
           grep -Fxq "USE_CUDA:STRING=ON" "$cmake_cache"
