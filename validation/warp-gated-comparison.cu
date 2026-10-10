@@ -75,15 +75,15 @@ extern "C" void JOIN(launch_special_, PROBE_VARIANT)(const ProbeType *input,
 using Launch = void (*)(const ProbeType *, ProbeType *, dim3, int, int);
 extern "C" void launch_baseline(const ProbeType *, ProbeType *, dim3, int, int);
 extern "C" void launch_ballot(const ProbeType *, ProbeType *, dim3, int, int);
-extern "C" void launch_pruned(const ProbeType *, ProbeType *, dim3, int, int);
+extern "C" void launch_geometry(const ProbeType *, ProbeType *, dim3, int, int);
 extern "C" void launch_special_ballot(const ProbeType *, ProbeType *, int, int);
-extern "C" void launch_special_pruned(const ProbeType *, ProbeType *, int, int);
+extern "C" void launch_special_geometry(const ProbeType *, ProbeType *, int, int);
 
 int main() {
   constexpr int blocks = 128;
   constexpr int trials = 21;
-  const Launch launches[] = {launch_baseline, launch_ballot, launch_pruned};
-  const char *names[] = {"baseline", "ballot", "pruned"};
+  const Launch launches[] = {launch_baseline, launch_ballot, launch_geometry};
+  const char *names[] = {"baseline", "ballot", "geometry"};
   const std::vector<dim3> shapes = {
       dim3(32),     dim3(64),      dim3(128), dim3(256), dim3(1024),
       dim3(8, 8),   dim3(4, 8, 2), dim3(1),   dim3(2),   dim3(3),
@@ -234,7 +234,7 @@ int main() {
         CUDA_CHECK(cudaMemcpy(reference.data(), device_output,
                               threads * sizeof(ProbeType),
                               cudaMemcpyDeviceToHost));
-        launch_special_pruned(device_input, device_output, threads, op);
+        launch_special_geometry(device_input, device_output, threads, op);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemcpy(observed.data(), device_output,
                               threads * sizeof(ProbeType),
