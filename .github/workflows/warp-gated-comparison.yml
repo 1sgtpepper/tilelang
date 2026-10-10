@@ -1,4 +1,4 @@
-name: Warp geometry performance probe
+name: Warp static extent performance probe
 
 on:
   workflow_dispatch:
@@ -35,9 +35,9 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          PROBE_RESULTS="$RUNNER_TEMP/warp-geometry-stage-$GITHUB_RUN_ID"
+          PROBE_RESULTS="$RUNNER_TEMP/warp-specialized-stage-$GITHUB_RUN_ID"
           echo "PROBE_RESULTS=$PROBE_RESULTS" >> "$GITHUB_ENV"
-          mkdir -p "$PROBE_RESULTS/geometry/src/tl_templates/cuda" "$PROBE_RESULTS/codegen"
+          mkdir -p "$PROBE_RESULTS/specialized/src/tl_templates/cuda" "$PROBE_RESULTS/codegen"
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(git -C baseline rev-parse HEAD)" = 194c1b897aa5269e9a89d44c88efdf578a3df620
@@ -67,8 +67,8 @@ jobs:
           /usr/bin/g++-15 --version | tee "$PROBE_RESULTS/gcc.txt"
           nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version,clocks.sm,temperature.gpu,utilization.gpu --format=csv,noheader \
             | tee "$PROBE_RESULTS/gpu-before.txt"
-          python3 - "$PROBE_RESULTS/geometry/src/tl_templates/cuda/reduce.h" \
-            "$PROBE_RESULTS/geometry-header.diff" <<'PY'
+          python3 - "$PROBE_RESULTS/specialized/src/tl_templates/cuda/reduce.h" \
+            "$PROBE_RESULTS/specialized-header.diff" <<'PY'
           import difflib
           import hashlib
           import sys
@@ -77,15 +77,33 @@ jobs:
           source = Path("source/src/tl_templates/cuda/reduce.h")
           target = Path(sys.argv[1])
           old = '  // A synchronized ballot preserves the launched prefix across scheduling.\n  const uint32_t warp_mask = __ballot_sync(mask, true);\n  if (warp_mask != mask) {\n    const int thread_idx =\n        threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);\n    const int lane = thread_idx % 32;\n    const int warp_threads = __popc(warp_mask);\n#pragma unroll\n    for (int offset = 16; offset > 0; offset /= 2) {\n      const bool has_partner = lane + offset < warp_threads;\n      // Missing partners must still shuffle from a participating lane.\n      const T other =\n          tl::shfl_down_sync(warp_mask, value, has_partner ? offset : 0);\n      if (has_partner)\n        value = op(value, other);\n    }\n    return tl::shfl_sync(warp_mask, value, 0);\n  }\n'
-          new = "  // Only the block's final launched warp can be partial.\n  const int block_threads = blockDim.x * blockDim.y * blockDim.z;\n  const int thread_idx =\n      threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);\n  if (thread_idx >= (block_threads & ~31)) {\n    const int warp_threads = block_threads & 31;\n    const uint32_t warp_mask = (1u << warp_threads) - 1u;\n    const int remaining = block_threads - thread_idx;\n#pragma unroll\n    for (int offset = 16; offset > 0; offset /= 2) {\n      const bool has_partner = offset < remaining;\n      // Missing partners must still shuffle from a participating lane.\n      const T other =\n          tl::shfl_down_sync(warp_mask, value, has_partner ? offset : 0);\n      if (has_partner)\n        value = op(value, other);\n    }\n    return tl::shfl_sync(warp_mask, value, 0);\n  }\n"
+          new = '  if constexpr (BlockThreads == 0 || BlockThreads % 32 != 0) {\n    // A synchronized ballot preserves the launched prefix across scheduling.\n    const uint32_t warp_mask = __ballot_sync(mask, true);\n    if (warp_mask != mask) {\n      const int thread_idx =\n          threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);\n      const int lane = thread_idx % 32;\n      const int warp_threads = __popc(warp_mask);\n  #pragma unroll\n      for (int offset = 16; offset > 0; offset /= 2) {\n        const bool has_partner = lane + offset < warp_threads;\n        // Missing partners must still shuffle from a participating lane.\n        const T other =\n            tl::shfl_down_sync(warp_mask, value, has_partner ? offset : 0);\n        if (has_partner)\n          value = op(value, other);\n      }\n      return tl::shfl_sync(warp_mask, value, 0);\n    }\n  }\n'
           text = source.read_text(encoding="utf-8")
           if text.count(old) != 1:
               raise SystemExit("expected exactly one current partial shuffle loop in source header")
           transformed = text.replace(old, new, 1)
+          declaration = "template <typename T, typename ReduceOp>\nTL_DEVICE T warp_reduce(T value, ReduceOp op);"
+          definition = "template <typename T, typename ReduceOp>\nTL_DEVICE T warp_reduce(T value, ReduceOp op) {"
+          if transformed.count(declaration) != 1 or transformed.count(definition) != 1:
+              raise SystemExit("expected one reducer declaration and definition")
+          transformed = transformed.replace(declaration,
+              "template <typename T, typename ReduceOp, int BlockThreads = 0>\nTL_DEVICE T warp_reduce(T value, ReduceOp op);", 1)
+          transformed = transformed.replace(definition,
+              "template <typename T, typename ReduceOp, int BlockThreads>\nTL_DEVICE T warp_reduce(T value, ReduceOp op) {", 1)
+          for name, operator in (("sum", "SumOp"), ("max", "MaxOp"), ("min", "MinOp"),
+                                 ("bitand", "BitAndOp"), ("bitor", "BitOrOp")):
+              wrapper = f"template <typename T> TL_DEVICE T warp_reduce_{name}(T value) {{"
+              call = f"return warp_reduce<T>(value, {operator}());"
+              if transformed.count(wrapper) != 1 or transformed.count(call) != 1:
+                  raise SystemExit(f"expected one wrapper and call for {name}")
+              transformed = transformed.replace(wrapper,
+                  f"template <typename T, int BlockThreads = 0> TL_DEVICE T warp_reduce_{name}(T value) {{", 1)
+              transformed = transformed.replace(call,
+                  f"return warp_reduce<T, {operator}, BlockThreads>(value, {operator}());", 1)
           target.write_text(transformed, encoding="utf-8")
           diff = difflib.unified_diff(
               text.splitlines(keepends=True), transformed.splitlines(keepends=True),
-              fromfile=str(source), tofile="geometry-stage-prototype/reduce.h")
+              fromfile=str(source), tofile="specialized-stage-prototype/reduce.h")
           Path(sys.argv[2]).write_text("".join(diff), encoding="utf-8")
           print("prototype header SHA256=" + hashlib.sha256(target.read_bytes()).hexdigest())
           PY
@@ -93,18 +111,18 @@ jobs:
           # but do not add that directory as an include root: it shadows CUDA's
           # <cuda_fp8.h> with TileLang's same-named wrapper.
           cp source/src/tl_templates/cuda/common.h \
-            "$PROBE_RESULTS/geometry/src/tl_templates/cuda/common.h"
-      - name: Run the 5,480-case direct oracle on baseline, ballot, and geometry
+            "$PROBE_RESULTS/specialized/src/tl_templates/cuda/common.h"
+      - name: Run the 5,480-case direct oracle on baseline, ballot, and specialized
         run: |
           set -euo pipefail
           cuda_nvcc=$(readlink -f "$(command -v nvcc)")
           cuda_root=$(dirname "$(dirname "$cuda_nvcc")")
           fixture=validation/validation/warp-reduce-check.cu
-          for variant in baseline ballot geometry; do
+          for variant in baseline ballot specialized; do
             case "$variant" in
               baseline) include_root=baseline/src ;;
               ballot) include_root=source/src ;;
-              geometry) include_root="$PROBE_RESULTS/geometry/src" ;;
+              specialized) include_root="$PROBE_RESULTS/specialized/src" ;;
             esac
             "$cuda_nvcc" -std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 \
               -I "$cuda_root/include/cccl" -I "$include_root" \
@@ -131,11 +149,11 @@ jobs:
           cuda_root=$(dirname "$(dirname "$cuda_nvcc")")
           fixture=validation/validation/warp-codegen-check.cu
           for target in sm_75 sm_120 sm_100a sm_100f; do
-            for variant in base candidate geometry; do
+            for variant in base candidate specialized; do
               case "$variant" in
                 base) include_root=baseline/src ;;
                 candidate) include_root=source/src ;;
-                geometry) include_root="$PROBE_RESULTS/geometry/src" ;;
+                specialized) include_root="$PROBE_RESULTS/specialized/src" ;;
               esac
               output="$PROBE_RESULTS/codegen/$variant-$target.ptx"
               "$cuda_nvcc" --ptx -std=c++17 -O3 "-arch=$target" \
@@ -152,7 +170,7 @@ jobs:
             | tee "$PROBE_RESULTS/codegen/ballot-codegen-summary.txt"
           python3 - "$PROBE_RESULTS/codegen" \
             validation/validation/warp-codegen-check.py \
-            > "$PROBE_RESULTS/codegen/geometry-codegen-check.txt" <<'PY'
+            > "$PROBE_RESULTS/codegen/specialized-codegen-check.txt" <<'PY'
           import importlib.util
           import re
           import sys
@@ -189,39 +207,39 @@ jobs:
           checked = []
           for target in ("sm_75", "sm_120", "sm_100a", "sm_100f"):
               if target != "sm_75" and checker.normalize(body("candidate", target, "warp_codegen_i32_sum")) != \
-                      checker.normalize(body("geometry", target, "warp_codegen_i32_sum")):
-                  raise SystemExit(f"{target}: geometry prototype changed integer fast path")
+                      checker.normalize(body("specialized", target, "warp_codegen_i32_sum")):
+                  raise SystemExit(f"{target}: specialized prototype changed integer fast path")
               if target == "sm_100a":
                   for op in ("min", "max"):
                       kernel = f"warp_codegen_f32_{op}"
                       if checker.normalize(body("candidate", target, kernel)) != \
-                              checker.normalize(body("geometry", target, kernel)):
-                          raise SystemExit(f"{target}: geometry prototype changed native f32 {op}")
+                              checker.normalize(body("specialized", target, kernel)):
+                          raise SystemExit(f"{target}: specialized prototype changed native f32 {op}")
               kernels = [("warp_codegen_f32_sum", 1), ("warp_codegen_f64_sum", 2)]
               if target != "sm_100a":
                   kernels.extend((f"warp_codegen_f32_{op}", 1) for op in ("min", "max"))
               for kernel, words in kernels:
                   ballot = metrics("candidate", target, kernel)
-                  geometry = metrics("geometry", target, kernel)
+                  specialized = metrics("specialized", target, kernel)
                   expected = [str(offset) for offset in (16, 8, 4, 2, 1) for _ in range(words)]
-                  for name, data in (("ballot", ballot), ("geometry", geometry)):
+                  for name, data in (("ballot", ballot), ("specialized", specialized)):
                       offsets = [item["lane_or_delta"] for item in data["shuffle_operands"]["bfly"]]
                       if offsets != expected:
                           raise SystemExit(f"{target} {kernel}: {name} full XOR sequence changed")
-                  for name, data in (("ballot", ballot), ("geometry", geometry)):
+                  for name, data in (("ballot", ballot), ("specialized", specialized)):
                       down = data["shuffle_operands"]["down"]
                       if len(down) != 5 * words or any(item["width"] != "b32" for item in down):
                           raise SystemExit(f"{target} {kernel}: {name} down-shuffle shape changed")
-                  if ballot["shuffle_operands"]["idx"] != geometry["shuffle_operands"]["idx"]:
+                  if ballot["shuffle_operands"]["idx"] != specialized["shuffle_operands"]["idx"]:
                       raise SystemExit(f"{target} {kernel}: lane-zero broadcast changed")
-                  for name, data in (("ballot", ballot), ("geometry", geometry)):
-                      if data["opcode_counts"].get("vote.sync.ballot.b32", 0) != (1 if name == "ballot" else 0):
+                  for name, data in (("ballot", ballot), ("specialized", specialized)):
+                      if data["opcode_counts"].get("vote.sync.ballot.b32", 0) != 1:
                           raise SystemExit(f"{target} {kernel}: unexpected membership vote count in {name}")
-                  checked.append((target, kernel, ballot, geometry))
+                  checked.append((target, kernel, ballot, specialized))
 
           print("Integer/native SM100 paths match; generic full XOR and broadcasts preserved.")
-          for target, kernel, ballot, geometry in checked:
-              print(target, kernel, "ballot=", ballot, "geometry=", geometry)
+          for target, kernel, ballot, specialized in checked:
+              print(target, kernel, "ballot=", ballot, "specialized=", specialized)
           PY
       - name: Compile paired timing kernels and record ptxas resources
         run: |
@@ -238,24 +256,29 @@ jobs:
               f16) cpp_type=half_t ;;
               bf16) cpp_type=bfloat16_t ;;
             esac
-            for variant in baseline ballot geometry; do
+            for variant in baseline ballot specialized; do
               case "$variant" in
                 baseline) include_root=baseline/src ;;
                 ballot) include_root=source/src ;;
-                geometry) include_root="$PROBE_RESULTS/geometry/src" ;;
+                specialized) include_root="$PROBE_RESULTS/specialized/src" ;;
               esac
+              variant_flags=()
+              if [[ "$variant" == specialized ]]; then
+                variant_flags+=(-DPROBE_STATIC_EXTENT)
+              fi
               "$cuda_nvcc" "${args[@]}" -I "$include_root" \
-                -DPROBE_VARIANT="$variant" -DPROBE_TYPE="$cpp_type" -Xptxas=-v -c "$fixture" \
+                -DPROBE_VARIANT="$variant" -DPROBE_TYPE="$cpp_type" \
+                "${variant_flags[@]}" -Xptxas=-v -c "$fixture" \
                 -o "$PROBE_RESULTS/$dtype-$variant.o" \
                 2>&1 | tee "$PROBE_RESULTS/$dtype-$variant-ptxas.txt"
               "$cuda_nvcc" "${args[@]}" -I "$include_root" \
-                -DPROBE_VARIANT="$variant" -DPROBE_TYPE="$cpp_type" --ptx "$fixture" \
+                -DPROBE_VARIANT="$variant" -DPROBE_TYPE="$cpp_type" "${variant_flags[@]}" --ptx "$fixture" \
                 -o "$PROBE_RESULTS/$dtype-$variant-sm_120.ptx"
             done
             "$cuda_nvcc" "${args[@]}" -I source/src -DPROBE_DRIVER -DPROBE_TYPE="$cpp_type" -c "$fixture" \
               -o "$PROBE_RESULTS/$dtype-driver.o"
             "$cuda_nvcc" "$PROBE_RESULTS/$dtype-driver.o" "$PROBE_RESULTS/$dtype-baseline.o" \
-              "$PROBE_RESULTS/$dtype-ballot.o" "$PROBE_RESULTS/$dtype-geometry.o" \
+              "$PROBE_RESULTS/$dtype-ballot.o" "$PROBE_RESULTS/$dtype-specialized.o" \
               -o "$PROBE_RESULTS/$dtype-comparison"
           done
       - name: Check typed outputs and measure bounded dependent calls
@@ -270,16 +293,16 @@ jobs:
             | tee "$PROBE_RESULTS/gpu-after.txt"
           sha256sum "$PROBE_RESULTS"/*.ptx "$PROBE_RESULTS"/codegen/*.ptx \
             | tee "$PROBE_RESULTS/ptx.sha256"
-      - name: Reuse pinned sanitizer on the geometry owner
+      - name: Reuse pinned sanitizer on the specialized owner
         run: |
           set -euo pipefail
           sanitizer="$RUNNER_TOOL_CACHE/.warp-cache/tools/cuda_sanitizer_api-linux-x86_64-13.3.27-archive/compute-sanitizer/compute-sanitizer"
           test -x "$sanitizer"
           "$sanitizer" --version | tee "$PROBE_RESULTS/sanitizer-version.txt"
-          sha256sum "$sanitizer" "$PROBE_RESULTS/oracle-geometry" \
+          sha256sum "$sanitizer" "$PROBE_RESULTS/oracle-specialized" \
             | tee "$PROBE_RESULTS/sanitizer-inputs.sha256"
           for tool in memcheck synccheck; do
-            "$sanitizer" --tool "$tool" --error-exitcode 7 "$PROBE_RESULTS/oracle-geometry" \
+            "$sanitizer" --tool "$tool" --error-exitcode 7 "$PROBE_RESULTS/oracle-specialized" \
               2>&1 | tee "$PROBE_RESULTS/$tool.txt"
             grep -q '^CASES=5480 FAILURES=0$' "$PROBE_RESULTS/$tool.txt"
             grep -q 'ERROR SUMMARY: 0 errors' "$PROBE_RESULTS/$tool.txt"
@@ -287,5 +310,5 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: warp-geometry-stage-comparison
-          path: ${{ runner.temp }}/warp-geometry-stage-${{ github.run_id }}/
+          name: warp-specialized-stage-comparison
+          path: ${{ runner.temp }}/warp-specialized-stage-${{ github.run_id }}/

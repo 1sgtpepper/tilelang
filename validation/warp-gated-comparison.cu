@@ -23,6 +23,7 @@ using ProbeType = PROBE_TYPE;
 #define JOIN_IMPL(a, b) a##b
 #define JOIN(a, b) JOIN_IMPL(a, b)
 
+template <int BlockThreads = 0>
 __global__ void JOIN(repeated_reduction_, PROBE_VARIANT)(const ProbeType *input,
                                                          ProbeType *output,
                                                          int iterations) {
@@ -37,7 +38,11 @@ __global__ void JOIN(repeated_reduction_, PROBE_VARIANT)(const ProbeType *input,
   const ProbeType increment = ProbeType((rank % 2 + 1) * 0.015625f);
 #pragma unroll 1
   for (int iteration = 0; iteration < iterations; ++iteration) {
+#ifdef PROBE_STATIC_EXTENT
+    value = tl::warp_reduce_sum<ProbeType, BlockThreads>(value);
+#else
     value = tl::warp_reduce_sum(value);
+#endif
     value = ProbeType(value * ProbeType(0.03125f) + increment);
   }
   output[index] = value;
@@ -46,8 +51,73 @@ __global__ void JOIN(repeated_reduction_, PROBE_VARIANT)(const ProbeType *input,
 extern "C" void JOIN(launch_, PROBE_VARIANT)(const ProbeType *input,
                                              ProbeType *output, dim3 shape,
                                              int blocks, int iterations) {
+#ifdef PROBE_STATIC_EXTENT
+  switch (shape.x * shape.y * shape.z) {
+  case 1:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<1><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 2:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<2><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 3:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<3><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 4:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<4><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 7:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<7><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 8:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<8><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 13:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<13><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 16:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<16><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 17:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<17><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 24:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<24><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 31:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<31><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 32:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<32><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 45:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<45><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 48:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<48><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 49:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<49><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 64:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<64><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 128:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<128><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 256:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<256><<<blocks, shape>>>(input, output, iterations);
+    break;
+  case 1024:
+    JOIN(repeated_reduction_, PROBE_VARIANT)<1024><<<blocks, shape>>>(input, output, iterations);
+    break;
+  default:
+    std::fprintf(stderr, "UNSUPPORTED_STATIC_EXTENT\n");
+    std::exit(2);
+  }
+#else
   JOIN(repeated_reduction_, PROBE_VARIANT)<<<blocks, shape>>>(input, output,
                                                               iterations);
+#endif
 }
 
 __global__ void JOIN(special_reduction_, PROBE_VARIANT)(const ProbeType *input,
@@ -75,15 +145,15 @@ extern "C" void JOIN(launch_special_, PROBE_VARIANT)(const ProbeType *input,
 using Launch = void (*)(const ProbeType *, ProbeType *, dim3, int, int);
 extern "C" void launch_baseline(const ProbeType *, ProbeType *, dim3, int, int);
 extern "C" void launch_ballot(const ProbeType *, ProbeType *, dim3, int, int);
-extern "C" void launch_geometry(const ProbeType *, ProbeType *, dim3, int, int);
+extern "C" void launch_specialized(const ProbeType *, ProbeType *, dim3, int, int);
 extern "C" void launch_special_ballot(const ProbeType *, ProbeType *, int, int);
-extern "C" void launch_special_geometry(const ProbeType *, ProbeType *, int, int);
+extern "C" void launch_special_specialized(const ProbeType *, ProbeType *, int, int);
 
 int main() {
   constexpr int blocks = 128;
   constexpr int trials = 21;
-  const Launch launches[] = {launch_baseline, launch_ballot, launch_geometry};
-  const char *names[] = {"baseline", "ballot", "geometry"};
+  const Launch launches[] = {launch_baseline, launch_ballot, launch_specialized};
+  const char *names[] = {"baseline", "ballot", "specialized"};
   const std::vector<dim3> shapes = {
       dim3(32),     dim3(64),      dim3(128), dim3(256), dim3(1024),
       dim3(8, 8),   dim3(4, 8, 2), dim3(1),   dim3(2),   dim3(3),
@@ -234,7 +304,7 @@ int main() {
         CUDA_CHECK(cudaMemcpy(reference.data(), device_output,
                               threads * sizeof(ProbeType),
                               cudaMemcpyDeviceToHost));
-        launch_special_geometry(device_input, device_output, threads, op);
+        launch_special_specialized(device_input, device_output, threads, op);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemcpy(observed.data(), device_output,
                               threads * sizeof(ProbeType),
