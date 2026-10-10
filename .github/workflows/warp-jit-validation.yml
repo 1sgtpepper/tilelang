@@ -762,19 +762,21 @@ jobs:
           import sys
           from pathlib import Path
 
+          assert "TL_TEMPLATE_PATH" not in os.environ
+          assert "PYTHONPATH" not in os.environ
           import tilelang
           import torch
           from cuda.bindings import nvrtc
           from tilelang.env import TILELANG_TEMPLATE_PATH
 
-          assert "TL_TEMPLATE_PATH" not in os.environ
-          assert "PYTHONPATH" not in os.environ
           package_path = Path(tilelang.__file__).resolve()
           assert package_path.is_relative_to(Path(sys.prefix).resolve()), package_path
           source_root = Path(os.environ["GITHUB_WORKSPACE"], "source").resolve()
           assert not package_path.is_relative_to(source_root), package_path
           template_root = Path(TILELANG_TEMPLATE_PATH).resolve()
           assert template_root == package_path.parent / "src", template_root
+          assert Path(os.environ["TL_TEMPLATE_PATH"]).resolve() == template_root
+          assert Path(os.environ["PYTHONPATH"]).resolve() == package_path.parent / "3rdparty/tvm/python"
           packaged_header = template_root / "tl_templates/cuda/reduce.h"
           source_header = source_root / "src/tl_templates/cuda/reduce.h"
           packaged_hash = hashlib.sha256(packaged_header.read_bytes()).hexdigest()
