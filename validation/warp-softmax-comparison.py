@@ -105,6 +105,10 @@ def softmax_func(T):
     return row_softmax
 
 
+def erase_extent(source: str) -> str:
+    return re.sub(r"(tl::warp_reduce_(?:sum|min|max|bitand|bitor))<[^<>]+, [0-9]+>\(", r"\1(", source)
+
+
 def worker(config: dict) -> int:
     import importlib.metadata
 
@@ -115,6 +119,11 @@ def worker(config: dict) -> int:
     from tilelang.env import CUDA_HOME, TILELANG_TEMPLATE_PATH
 
     variant = config["variant"]
+    if variant == "baseline":
+        # The original helper has no extent parameter; restore its original call.
+        from tilelang.engine import register_cuda_postproc
+
+        register_cuda_postproc(lambda source, target: erase_extent(source))
     template = Path(config["template"]).resolve(strict=True)
     if Path(os.environ.get("TL_TEMPLATE_PATH", "")).resolve(strict=True) != template:
         raise ValueError("worker TL_TEMPLATE_PATH does not select its configured template tree")
@@ -181,7 +190,7 @@ def worker(config: dict) -> int:
         calls = {"tl::warp_reduce_sum(": 3}
         # This is a separate same-source compile inspection, not the timed binary.
         ptx = kernel._get_ptx()
-        if ".target sm_120" not in ptx or (config["variant"] == "candidate" and "vote.sync.ballot" not in ptx):
+        if ".target sm_120" not in ptx or "vote.sync.ballot" in ptx:
             raise AssertionError("auxiliary PTX does not exercise the expected SM120 fallback")
         Path(config["output_dir"], f"{variant}-auxiliary.ptx").write_text(ptx, encoding="utf-8")
     elif config["workload"] == "softmax":
@@ -198,7 +207,7 @@ def worker(config: dict) -> int:
     launch_options = {"stream": stream.cuda_stream} if config["workload"] == "softmax" else {}
 
     source = kernel.get_kernel_source()
-    if any(source.count(call) != count for call, count in calls.items()):
+    if any(erase_extent(source).count(call) != count for call, count in calls.items()):
         raise ValueError("generated source does not contain the workload's exact direct helper calls")
     source_bytes = source.encode("utf-8")
     source_path = Path(config["output_dir"]) / f"{variant}-kernel.cu"
@@ -255,6 +264,8 @@ def worker(config: dict) -> int:
         "consumer_commit": CONSUMER_COMMIT if config["workload"] == "engram" else None,
         "execution_backend": kernel.execution_backend,
         "generated_cuda_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "comparison_cuda_sha256": hashlib.sha256(erase_extent(source).encode()).hexdigest(),
+        "baseline_call_adjustment": "erase optional extent template arguments only" if variant == "baseline" else None,
         "generated_cuda_path": str(source_path),
         "tilelang_path": str(package_path),
         "tilelang_version": importlib.metadata.version("tilelang"),
@@ -493,7 +504,7 @@ def controller(args: argparse.Namespace) -> int:
             "nvrtc_version",
             "gpu_name",
             "compute_capability",
-            "generated_cuda_sha256",
+            "comparison_cuda_sha256",
             "input_sha256",
             "workload",
             "consumer_commit",

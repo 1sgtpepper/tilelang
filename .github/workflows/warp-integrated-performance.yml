@@ -1,0 +1,162 @@
+name: Warp integrated performance validation
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact compiler and reducer source commit
+        required: true
+        type: string
+      wheel_run:
+        description: Successful exact-source wheel build run
+        required: true
+        type: string
+permissions:
+  actions: read
+  contents: read
+jobs:
+  integrated:
+    runs-on: [self-hosted, linux, x64, warp-validation]
+    timeout-minutes: 45
+    env:
+      CUDA_HOME: /home/sgtpepper/.local/cuda-13.3
+      NVCC_CCBIN: /usr/bin/g++-15
+      CXX: /usr/bin/g++-15
+      TILELANG_DISABLE_CACHE: "1"
+      PYTHONPATH: ""
+      UV_HTTP_TIMEOUT: "300"
+      UV_CONCURRENT_DOWNLOADS: "3"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: deepseek-ai/TileKernels
+          ref: 66258df6175d2f630ffecb04c5ab66bff8a2ae6a
+          path: consumer
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: tilelang-native-wheel
+          run-id: ${{ inputs.wheel_run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/integrated-wheelhouse
+      - name: Verify and install the exact wheel
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
+          WHEEL_RUN: ${{ inputs.wheel_run }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WHEEL_RUN" =~ ^[0-9]+$ ]]
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(cat "$RUNNER_TEMP/integrated-wheelhouse/source-sha.txt")" = "$SOURCE_SHA"
+          gh run view "$WHEEL_RUN" --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion | grep -Fx success
+          (cd "$RUNNER_TEMP/integrated-wheelhouse" && sha256sum -c wheel.sha256)
+          sha256sum -c "$RUNNER_TEMP/integrated-wheelhouse/source-files.sha256"
+          echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
+          echo "UV_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/uv" >> "$GITHUB_ENV"
+          echo "PIP_CACHE_DIR=$RUNNER_TOOL_CACHE/.warp-cache/pip" >> "$GITHUB_ENV"
+          uv venv --python 3.12 "$RUNNER_TEMP/integrated-venv"
+          mapfile -t wheels < <(find "$RUNNER_TEMP/integrated-wheelhouse" -maxdepth 1 -name 'tilelang-*.whl' -print)
+          test "${#wheels[@]}" -eq 1
+          uv pip install --python "$RUNNER_TEMP/integrated-venv/bin/python" \
+            'https://download-r2.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=5359b255ac68c0cabb8293952b38e00f0d1a570815cd87f19b61af702c071410'
+          uv pip install --python "$RUNNER_TEMP/integrated-venv/bin/python" \
+            "${wheels[0]}" 'pytest==9.1.1' 'cuda-bindings==13.4.3'
+          output="$RUNNER_TEMP/warp-integrated-$GITHUB_RUN_ID"
+          mkdir -p "$output" "$RUNNER_TEMP/integrated-baseline" "$RUNNER_TEMP/integrated-candidate" "$RUNNER_TEMP/integrated-ballot"
+          echo "INTEGRATED_OUTPUT=$output" >> "$GITHUB_ENV"
+          for variant in baseline candidate ballot; do
+            cp -a source/src/. "$RUNNER_TEMP/integrated-$variant/"
+          done
+          git -C source show 194c1b897aa5269e9a89d44c88efdf578a3df620:src/tl_templates/cuda/reduce.h \
+            > "$RUNNER_TEMP/integrated-baseline/tl_templates/cuda/reduce.h"
+          git -C source show 5f45e2bd33434274c6a2843123ca7df0c8737a7d:src/tl_templates/cuda/reduce.h \
+            > "$RUNNER_TEMP/integrated-ballot/tl_templates/cuda/reduce.h"
+          cp "$RUNNER_TEMP/integrated-wheelhouse/source-sha.txt" "$output/"
+          cp "$RUNNER_TEMP/integrated-wheelhouse/wheel.sha256" "$output/"
+          git -C validation rev-parse HEAD > "$output/validation-commit.txt"
+          sha256sum validation/validation/warp-generated-extent-check.py \
+            validation/validation/warp-softmax-comparison.py > "$output/fixtures.sha256"
+          nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv,noheader > "$output/gpu.txt"
+          nvcc --version > "$output/nvcc.txt"
+      - name: Verify installed package and generated 84-case PTX matrix
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          unset TL_TEMPLATE_PATH PYTHONPATH
+          "$RUNNER_TEMP/integrated-venv/bin/python" - <<'PY'
+          import hashlib, os, sys
+          from pathlib import Path
+          import tilelang, torch
+          from tilelang.env import TILELANG_TEMPLATE_PATH
+          package = Path(tilelang.__file__).resolve()
+          assert package.is_relative_to(Path(sys.prefix).resolve()), package
+          template = Path(TILELANG_TEMPLATE_PATH).resolve()
+          assert template == package.parent / "src"
+          source = Path(os.environ["GITHUB_WORKSPACE"], "source/src/tl_templates/cuda/reduce.h")
+          assert hashlib.sha256(source.read_bytes()).digest() == hashlib.sha256((template / "tl_templates/cuda/reduce.h").read_bytes()).digest()
+          assert torch.cuda.is_available() and torch.cuda.device_count() == 1
+          assert torch.cuda.get_device_capability() == (12, 0)
+          print(f"installed_package={package} template={template}")
+          PY
+          "$RUNNER_TEMP/integrated-venv/bin/python" \
+            "$GITHUB_WORKSPACE/validation/validation/warp-generated-extent-check.py" \
+            "$INTEGRATED_OUTPUT/generated" \
+            "$RUNNER_TEMP/integrated-baseline/tl_templates/cuda/reduce.h" \
+            "$RUNNER_TEMP/integrated-ballot/tl_templates/cuda/reduce.h" \
+            2>&1 | tee "$INTEGRATED_OUTPUT/generated.log"
+      - name: Compare actual softmax and unchanged Engram kernels
+        working-directory: ${{ runner.temp }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          unset TL_TEMPLATE_PATH PYTHONPATH
+          wheel=$(find "$RUNNER_TEMP/integrated-wheelhouse" -maxdepth 1 -name 'tilelang-*.whl' -print)
+          wheel_sha=$(sha256sum "$wheel" | cut -d' ' -f1)
+          baseline_sha=$(sha256sum "$RUNNER_TEMP/integrated-baseline/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
+          candidate_sha=$(sha256sum "$RUNNER_TEMP/integrated-candidate/tl_templates/cuda/reduce.h" | cut -d' ' -f1)
+          for workload in softmax engram; do
+            "$RUNNER_TEMP/integrated-venv/bin/python" \
+              "$GITHUB_WORKSPACE/validation/validation/warp-softmax-comparison.py" \
+              --workload "$workload" --consumer-root "$GITHUB_WORKSPACE/consumer" \
+              --baseline-template "$RUNNER_TEMP/integrated-baseline" \
+              --candidate-template "$RUNNER_TEMP/integrated-candidate" \
+              --baseline-header-sha "$baseline_sha" --candidate-header-sha "$candidate_sha" \
+              --source-sha "$SOURCE_SHA" --wheel-source-sha "$SOURCE_SHA" \
+              --wheel-path "$wheel" --wheel-sha "$wheel_sha" \
+              --output-dir "$INTEGRATED_OUTPUT/$workload" \
+              2>&1 | tee "$INTEGRATED_OUTPUT/$workload.log"
+          done
+          "$RUNNER_TEMP/integrated-venv/bin/python" - "$INTEGRATED_OUTPUT" <<'PY'
+          import json, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          for name in ("softmax", "engram"):
+              report = json.loads((root / name / "summary.json").read_text())
+              median = report["candidate_change_percent_median"]
+              upper = report["candidate_change_percent_bootstrap_95_ci"][1]
+              print(name, "median_percent", median, "upper_95_percent", upper)
+              assert median <= 5 and upper <= 5, (name, median, upper)
+              assert not report["environment_flags"], report["environment_flags"]
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: warp-integrated-performance
+          path: |
+            ${{ runner.temp }}/warp-integrated-${{ github.run_id }}/
+            !${{ runner.temp }}/warp-integrated-${{ github.run_id }}/**/input-*.bin
+            !${{ runner.temp }}/warp-integrated-${{ github.run_id }}/**/*-output.bin
+          if-no-files-found: warn
+          retention-days: 7
