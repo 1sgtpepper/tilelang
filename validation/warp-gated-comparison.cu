@@ -54,61 +54,80 @@ extern "C" void JOIN(launch_, PROBE_VARIANT)(const ProbeType *input,
 #ifdef PROBE_STATIC_EXTENT
   switch (shape.x * shape.y * shape.z) {
   case 1:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<1><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<1>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 2:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<2><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<2>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 3:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<3><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<3>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 4:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<4><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<4>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 7:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<7><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<7>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 8:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<8><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<8>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 13:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<13><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<13>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 16:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<16><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<16>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 17:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<17><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<17>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 24:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<24><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<24>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 31:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<31><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<31>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 32:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<32><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<32>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 45:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<45><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<45>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 48:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<48><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<48>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 49:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<49><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<49>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 64:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<64><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<64>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 128:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<128><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<128>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 256:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<256><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<256>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   case 1024:
-    JOIN(repeated_reduction_, PROBE_VARIANT)<1024><<<blocks, shape>>>(input, output, iterations);
+    JOIN(repeated_reduction_, PROBE_VARIANT)<1024>
+        <<<blocks, shape>>>(input, output, iterations);
     break;
   default:
     std::fprintf(stderr, "UNSUPPORTED_STATIC_EXTENT\n");
@@ -145,14 +164,17 @@ extern "C" void JOIN(launch_special_, PROBE_VARIANT)(const ProbeType *input,
 using Launch = void (*)(const ProbeType *, ProbeType *, dim3, int, int);
 extern "C" void launch_baseline(const ProbeType *, ProbeType *, dim3, int, int);
 extern "C" void launch_ballot(const ProbeType *, ProbeType *, dim3, int, int);
-extern "C" void launch_specialized(const ProbeType *, ProbeType *, dim3, int, int);
+extern "C" void launch_specialized(const ProbeType *, ProbeType *, dim3, int,
+                                   int);
 extern "C" void launch_special_ballot(const ProbeType *, ProbeType *, int, int);
-extern "C" void launch_special_specialized(const ProbeType *, ProbeType *, int, int);
+extern "C" void launch_special_specialized(const ProbeType *, ProbeType *, int,
+                                           int);
 
 int main() {
   constexpr int blocks = 128;
   constexpr int trials = 21;
-  const Launch launches[] = {launch_baseline, launch_ballot, launch_specialized};
+  const Launch launches[] = {launch_baseline, launch_ballot,
+                             launch_specialized};
   const char *names[] = {"baseline", "ballot", "specialized"};
   const std::vector<dim3> shapes = {
       dim3(32),     dim3(64),      dim3(128), dim3(256), dim3(1024),
