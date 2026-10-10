@@ -57,7 +57,7 @@ rows = []
 for dtype in ("float32", "float64", "float16", "bfloat16"):
     for shape in SHAPES:
         size = math.prod(shape)
-        artifact = lower(kernel(dtype, shape), target="cuda -arch=sm_120", enable_device_compile=False)
+        artifact = lower(kernel(dtype, shape), target={"kind": "cuda", "arch": "sm_120"}, enable_device_compile=False)
         source = artifact.kernel_source
         full = size % 32 == 0
         calls = re.findall(r"tl::warp_reduce_sum(?:<[^<>]+, ([0-9]+)>)?\(", source)
