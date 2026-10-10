@@ -1,0 +1,79 @@
+name: Warp gated ballot comparison
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact ballot candidate commit
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  comparison:
+    runs-on: [self-hosted, linux, x64, warp-validation]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: 194c1b897aa5269e9a89d44c88efdf578a3df620
+          path: baseline
+          persist-credentials: false
+      - name: Verify exact sources and environment
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p baseline-results
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C baseline rev-parse HEAD)" = 194c1b897aa5269e9a89d44c88efdf578a3df620
+          git -C source submodule update --init --depth=1 3rdparty/cutlass
+          for tree in baseline source; do
+            git -C "$tree" ls-tree HEAD 3rdparty/cutlass | tee "baseline-results/$tree-cutlass.txt"
+            git -C "$tree" rev-parse HEAD | tee "baseline-results/$tree-commit.txt"
+            git -C "$tree" ls-tree -r HEAD src/tl_templates | grep -v 'cuda/reduce.h$' > "baseline-results/$tree-other-templates.txt"
+          done
+          cmp baseline-results/baseline-cutlass.txt baseline-results/source-cutlass.txt
+          cmp baseline-results/baseline-other-templates.txt baseline-results/source-other-templates.txt
+          sha256sum {baseline,source}/src/tl_templates/cuda/reduce.h validation/validation/warp-gated-comparison.cu | tee baseline-results/source.sha256
+          nvcc --version | tee baseline-results/nvcc.txt
+          /usr/bin/g++-15 --version | tee baseline-results/gcc.txt
+          nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version,clocks.sm,temperature.gpu,utilization.gpu --format=csv,noheader | tee baseline-results/gpu-before.txt
+      - name: Compile the exact headers and two proven gates
+        run: |
+          set -euo pipefail
+          cuda_nvcc=$(readlink -f "$(command -v nvcc)")
+          cuda_root=$(dirname "$(dirname "$cuda_nvcc")")
+          args=(-std=c++17 -O3 -arch=sm_120 -ccbin /usr/bin/g++-15 -I "$cuda_root/include/cccl" -I source/3rdparty/cutlass/include)
+          fixture=validation/validation/warp-gated-comparison.cu
+          for variant in baseline ballot hybrid xgate; do
+            tree=$variant
+            extra=()
+            if [[ "$variant" == ballot ]]; then tree=source; fi
+            if [[ "$variant" == hybrid ]]; then tree=source; extra=(-DPROBE_HYBRID); fi
+            if [[ "$variant" == xgate ]]; then tree=source; extra=(-DPROBE_XGATE); fi
+            "$cuda_nvcc" "${args[@]}" -I "$tree/src" -DPROBE_VARIANT="$variant" "${extra[@]}" -Xptxas=-v -c "$fixture" -o "$variant.o" 2>&1 | tee "baseline-results/$variant-compile.log"
+            "$cuda_nvcc" "${args[@]}" -I "$tree/src" -DPROBE_VARIANT="$variant" "${extra[@]}" --ptx "$fixture" -o "baseline-results/$variant.ptx"
+          done
+          "$cuda_nvcc" "${args[@]}" -I source/src -DPROBE_DRIVER -c "$fixture" -o driver.o
+          "$cuda_nvcc" "${args[@]}" driver.o baseline.o ballot.o hybrid.o xgate.o -o baseline-comparison
+      - name: Check outputs and measure bounded dependent calls
+        run: |
+          set -euo pipefail
+          ./baseline-comparison | tee baseline-results/comparison.txt
+          grep -q '^COMPARISON_OUTPUTS_AND_ONE_CALL_ORACLE=PASS$' baseline-results/comparison.txt
+          nvidia-smi --query-gpu=clocks.sm,temperature.gpu,utilization.gpu --format=csv,noheader | tee baseline-results/gpu-after.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: warp-gated-comparison
+          path: baseline-results/
