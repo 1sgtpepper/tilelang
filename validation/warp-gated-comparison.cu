@@ -17,23 +17,23 @@
 __device__ __forceinline__ float gated_sum(float value) {
   constexpr unsigned full = 0xffffffff;
 #ifdef PROBE_HYBRID
-  const unsigned warp_mask = (blockDim.x * blockDim.y * blockDim.z) % 32 == 0
-      ? full : __ballot_sync(full, true);
+  if ((blockDim.x * blockDim.y * blockDim.z) % 32 != 0) {
 #else
-  const unsigned warp_mask = blockDim.x % 32 == 0
-      ? full : __ballot_sync(full, true);
+  if (blockDim.x % 32 != 0) {
 #endif
-  if (warp_mask != full) {
-    const int rank = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
-    const int lane = rank % 32;
-    const int members = __popc(warp_mask);
+    const unsigned warp_mask = __ballot_sync(full, true);
+    if (warp_mask != full) {
+      const int rank = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+      const int lane = rank % 32;
+      const int members = __popc(warp_mask);
 #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-      const bool has_partner = lane + offset < members;
-      const float other = tl::shfl_down_sync(warp_mask, value, has_partner ? offset : 0);
-      if (has_partner) value += other;
+      for (int offset = 16; offset > 0; offset /= 2) {
+        const bool has_partner = lane + offset < members;
+        const float other = tl::shfl_down_sync(warp_mask, value, has_partner ? offset : 0);
+        if (has_partner) value += other;
+      }
+      return tl::shfl_sync(warp_mask, value, 0);
     }
-    return tl::shfl_sync(warp_mask, value, 0);
   }
   value += tl::shfl_xor_sync(full, value, 16);
   value += tl::shfl_xor_sync(full, value, 8);
